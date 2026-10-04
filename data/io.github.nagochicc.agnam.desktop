@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Agnam
+Comment=漫画・画像Viewer
+Exec=agnam
+Icon=io.github.nagochicc.agnam
+Terminal=false
+Type=Application
+Categories=Graphics;Viewer;
+StartupNotify=true

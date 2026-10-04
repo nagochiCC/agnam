@@ -1,0 +1,149 @@
+# 本棚設計仕様
+
+この文書はLibrary、本棚検索、お気に入り、Cover thumbnail、並び替え、breadcrumb、起動復元に関する安定した仕様・設計判断をまとめる。関連作業で必要な箇所だけ参照する。
+
+## 本棚scanと表示対象
+
+- Libraryはfilesystem scanを基盤とし、閲覧可能コンテンツを持つ子フォルダと直下の対応ファイルを表示する。
+- 画像は通常対応拡張子で判定する。archiveは外側の対応拡張子だけでなく、entry listingに対応画像または対応nested archiveが1件以上ある場合だけ採用する。
+- 正常でも非対応entryしか持たないarchiveや個別listingできないarchiveはscan対象外としてスキップし、scan段階では画像decodeやnested archiveの再帰展開を行わない。
+- archiveのviewable-content判定はGLib標準user cache配下の永続probe cacheを使い、archive path・size・mtime・cache format versionが一致する間はbackendのentry listing probeを再実行しない。成功したtrue / falseだけを保存し、probe errorは永続falseとして保存しない。破損・version不一致・source更新はmissとして実probeへfallbackする。同じcacheは本棚scanとSearchIndex構築で共有する。
+- filesystem上の対応画像のうちstemがASCII大小文字を区別せず `cover` のものは、本棚の項目・フォルダpreview候補・画像Bookの通常読書pageから除外する。同じ判定をフォルダD&D時の開始対象選択にも適用する。ただし `cover.xxx` 自体を明示的なfile pathとして開いた場合は、その1枚だけのDocumentとして閲覧を許可する。
+- 子フォルダが直下に `cover` 以外の対応画像を1件以上持つ場合、そのフォルダを画像Bookとして扱い、自然順先頭画像を画像Documentのentry pointとしてscan結果に保持する。Book判定は直下だけを対象とし、下位フォルダに画像があるだけではBookにしない。
+- 直下に `cover` 以外の対応画像を持たず、下位フォルダやarchiveだけをまとめるフォルダはcontainer / seriesフォルダとして扱う。
+- 本棚scanは専用request IDを付けてbackground実行し、stale結果を現在状態へ反映しない。
+- 通常filesystem本棚のscan結果はsession中に本棚rootと現在directoryまでのancestor chainだけをmemory保持する。cached directoryへ再訪した場合は保持済み結果を即表示したままbackground再scanし、結果が同一ならUIを再構築せず、外部変更があれば自動更新する。親へ戻る・siblingへ移動する際は離れたchild branchのcacheを破棄し、cached refresh失敗時は既存表示を維持する。archive内容表示はこのfilesystem chain cacheへ含めない。
+- 正常にscanできた本棚rootの `BookshelfDirectory` 相当はversion付きsnapshotとしてuser cacheへ永続保存する。次回起動時は設定済みrootが現在directoryとして利用可能な場合だけsnapshotをsession cacheへseedして即表示し、その後もfresh scanをbackgroundで必ず実行する。fresh scanが同一ならUIを再構築せず、変更があれば通常refreshとして更新する。rootが未mount / 不在 / 読取不能、snapshot破損・version不一致・root不一致ではsnapshotを使わず従来のscan / error経路へfallbackする。archive内容表示には適用しない。
+- 通常本棚の表示項目について更新日時・作成日時をscan時に取得して保持し、並び替えのためのfilesystem metadata取得をUI threadで行わない。
+
+## 本棚カード
+
+- container / seriesフォルダは上側のFolder groupへフォルダカードとして表示し、画像Bookフォルダと直下の対応ファイルは下側のBook groupへ同じCoverカード形式で表示する。通常本棚では「フォルダ」「本」の見出し文字を表示しない。Folderがない場合はBook groupを上端から、Bookがない場合はFolder groupだけを表示し、空のgroup領域は残さない。単独画像も直下の読書対象としてBook groupに含める。
+- container / seriesフォルダのpreviewは自然順の候補を本の束として表示する。先頭候補を表表紙、続く最大4件を擬似背表紙として表示する。さらに候補がある場合も残数の `+N` ラベルは現在表示しない。直下の項目が子フォルダの場合は、その子フォルダ配下で最初に見つかる閲覧可能fileを代表候補として使うため、作品フォルダをまとめる上位フォルダでも各作品の先頭Bookを並べて表現できる。カード全体のクリックは従来どおりLibrary navigationとする。
+- Folder previewの表表紙は設定された「本棚の本の高さ」をそのまま表示高さとし、元画像のaspect ratioを維持して横幅を決める。横幅は高さの1.5倍を上限とし、それを超える横長画像だけ左右をcropする。背表紙は表表紙より上端7px・下端3px内側へ置き、表示高さを `H - 10px` とする一方、横幅は従来の見た目を維持するため `（H - 14px）/ 9` を基準にする。表表紙と背表紙、背表紙同士の間隔は0px。表表紙は左端1pxの弱いハイライトと右端1pxの弱い影だけを重ね、背表紙は左端2pxのハイライトと右端2pxの影だけを重ねる。中央glossは使用しない。表表紙・背表紙には外周border、通常drop shadow、強い角丸を付けず、背表紙の最下端1pxの左右外角だけ40% opacityとして控えめな丸みを付ける。棚への接地影はShelfContainer側で担当し、hover時にも本自体をshadowで持ち上げない。Folderカードは最低100px幅を確保し、preview bundleがそれより広い場合は自然幅へ追従する。カード名だけでさらに幅を広げない。
+- Folder previewとBook Coverは共通の「本棚の本の高さ」設定を使用し、設定値そのものを表示高として扱う。範囲は81～262px、defaultは130px。旧設定からのmigrationでは従来のFolder側の値を共通高さの基準として引き継ぐ。通常Bookも画像のaspect ratioから自然幅を決め、高さの1.5倍を上限として超過分だけ左右をcropする。
+- 通常本棚ではFolder / Book各rowの下端に木製の疑似3D棚板を描画し、Book CoverとFolder previewの実表示下端を共通の接地基準として棚面の手前端から奥へ1/4の位置へ揃える。棚板は本より背面に描画し、明るい台形の上面と濃い長方形の前面で奥行きを表現する。上面・前面には外部画像assetを使わない決定論的な木目を重ね、上面の木目は台形の奥ほど圧縮して簡易perspectiveを持たせる。通常BookのCoverもslot内で下端揃えとし、横長画像が棚から浮かないようにする。本から棚上面へは弱い接地影を落とし、通常BookとFolder先頭表表紙は個別shadow、Folder背表紙群は群全体で1つのshared shadowとする。影は棚上面内にclipし、奥側へfadeしつつ左右へわずかに広がり、手前側にも短いcontact shadowだけを出す。棚の左右は接地点の台形形状から算出した16pxへ安全余白12pxを加え、Folder / Book共通で28pxのcontent insetを確保する。タイトルは棚前面と下側の影が終わったあとに2px空けて表示する。棚・木目・接地影はcustom `ShelfContainer` のsnapshotで描画し、本棚contentは通常のlayout childとして保持し、measured overlay構造は使用しない。
+- カード／Cover寸法はviewport高さに応じて縮小せず、縦に収まらない場合はscrollする。
+- Folder groupは最低100pxを含む各Folderカードの自然幅を維持したまま横方向へ詰め、Folder間32pxで利用可能幅に応じて折り返す専用wrap layoutを使う。Book groupはnon-homogeneousな `FlowBox` で各Bookカードの自然幅を維持し、Book間12pxで折り返す。各group内では現在の本棚並び替え設定に従う。
+- カード名はFolder / Book共通で最低100px程度の表示幅を確保し、1行・中央揃え・末尾省略とする。表紙やpreview bundleが100pxより広い場合はそのカード幅を利用できるが、名前だけを理由にカード幅をさらに広げない。tooltipで全文を確認できる。hover時はFolder / Bookとも同じFlowBoxChild系visualを使い、薄いグレーの角丸背景で同程度の選択フィードバックを表示する。
+- 画像BookフォルダのBookカードは解決済みCover sourceを表示し、クリックでそのフォルダの画像DocumentをViewerへ直接開く。同一作品で最後に読んだBookがその画像フォルダで、かつ作品読了状態でなければ保存済み読書位置から再開する。読了済みなら保存pageを再開位置に使わず自然順先頭のentry pointから開始し、別の画像Bookが最新なら古い位置を流用しない。container / seriesフォルダは従来どおりフォルダカード全体でLibrary navigationする。direct fileは既存Document load経路でViewerへ開く。
+- archive Bookの右クリックでは「最初から読む」「お気に入りに追加 / お気に入りから削除」「アーカイブの内容を表示」「表紙を変更」を表示する。画像Bookフォルダでは「最初から読む」「お気に入りに追加 / お気に入りから削除」「フォルダの内容を表示」「表紙を変更」を表示する。container / seriesフォルダにはこのBook用menuを追加しない。検索結果・履歴一覧へ本棚カード用の右クリックメニューは広げない。
+- 「フォルダの内容を表示」は外部file managerを起動せず、AgnamのLibraryでそのフォルダへnavigationする。「アーカイブの内容を表示」はarchive内部のvirtual Libraryへ移動する。
+- 「最初から読む」は保存済み読書位置をその場で削除せず、そのopenだけ先頭pageを初期位置として既存Document load経路へ渡す。読み込み成功後は通常の履歴記録・位置更新へ合流し、読み込み失敗だけで既存の読書位置を失わない。
+- Cover読み込み中は枠と背景だけを表示し、取得・生成またはTexture変換の失敗が確定したsourceだけ未取得iconを表示する。
+
+## archive内容表示
+
+- archive Bookの「アーカイブの内容を表示」は、archiveを汎用file managerとして展開せず、Agnamで意味のある内容だけをLibrary形式で階層表示する。対応画像、対応画像または対応nested archiveへ到達するためのfolder、対応nested archiveを表示し、その他の非対応fileやmacOS metadata等は表示しない。
+- archive内部の実階層を維持し、rootを開いただけでnested archive内部を再帰的に全走査しない。nested archiveはユーザーがそのcontainerへ入った時点で読み込み、再帰上限と安全な一時展開規則を維持する。一時pathは永続identityに使用しない。
+- breadcrumbは通常Libraryと同じ操作感で `home > archive > folder > nested archive ...` を表現し、祖先segmentからarchive内部の任意の既表示階層へ戻れる。先頭home iconは「本棚トップ」を表し、archiveのrootにいる場合はLibrary本棚へ戻る。
+- 各階層の表示順は通常本棚の並び替え設定とは独立したnatural ascendingとする。Sequential / solid archiveでも実際の展開順にcardを追加・再配置せず、entry metadataから最終位置を先に確定してplaceholderを置き、取得できたthumbnailを対応する固定位置へ反映する。
+- Random Access archiveのthumbnailはvisible demandを優先し、一覧表示のために全画像を展開しない。progressive対応Sequential archiveは一度の順次走査でthumbnailを生成し、Viewer用Documentや全画像byteを完成まで保持しない。高並列decodeは行わず、UI応答性とPC負荷の抑制を優先する。
+- archive内容表示を離れた後のbackground listing / thumbnail結果はsession / request世代を検証して破棄し、現在のLibraryへstale結果を反映しない。
+- 通常画像cardを左クリックすると、内容一覧専用Documentではなく元のarchive Documentを開き、その画像Assetの先頭logical pageから開始する。nested archive内の画像もstableなarchive chain + image path identityで元Document上の対応位置を解決する。
+- archive内の画像cardは右クリック「表紙にする」を提供し、root archive Bookのmanual internal Coverとして保存する。nested archive内部の画像を指定した場合もtemporary extraction pathではなくstable logical identityを永続化する。
+
+## Cover選択と表紙専用画像
+
+- 手動Cover overrideはarchive Bookと画像Bookフォルダを対象とし、単独画像fileにはBook固有のoverrideを持たせない。manual overrideはautomatic Coverより優先し、内容一覧の画像右クリック「表紙にする」またはBook cardの「表紙を変更 > 外部画像から選択…」から設定する。「表紙を変更 > 自動」でmanual overrideを削除してautomaticへ戻す。
+- 外部Coverは選択元file pathへ依存せず、Agnamのuser data領域へcopyして永続化する。同一Bookで新しいmanual internal Coverまたは「自動」が選ばれた場合は進行中の古いexternal requestを無効化し、遅れて返った結果で新しい選択を上書きしない。
+- 画像Bookのinternal CoverはBook folderからのstable relative path、archiveのinternal Coverはroot archive pathとnested archive chain + image pathのstable identityで保持する。保存済みinternal sourceが欠損・不正になった場合はinvalid overrideを削除してautomatic Coverへfallbackする。
+- Cover変更時は本棚だけでなく、同じCover resolutionを利用する検索・履歴・お気に入りの表示／cacheもinvalid化し、各表示scopeの既存非同期安全性を維持する。通常本棚はancestor chain上のmemory Texture LRUも全invalid化し、古いCover Textureが親directoryへ戻った際に復活しないようにする。
+- automatic Coverは画像Bookでは直下の `cover.jpg/jpeg/png/webp`（stem `cover` はASCII case-insensitive）をnatural sortして最優先し、存在しなければ直下の非cover対応画像の自然順先頭を使う。複数の `cover.xxx` がある場合はnatural sort先頭を採用する。
+- archiveではrootまたはtransparentな単一wrapper-folder chain直下の `cover.xxx` をautomatic Cover hintとして優先し、それより深い任意folderやnested archiveの `cover.xxx` を親archiveのautomatic Coverへ昇格させない。hintがなければ通常の自然順先頭画像を使う。
+- 画像Book直下の `cover.xxx` は表紙専用画像として通常読書pageから除外するが、「フォルダの内容を表示」には通常画像より前へnatural sortして表示する。左クリックではViewerを開かず、右クリック「表紙にする」は使用できる。card右上へ小さな閲覧不可symbolic indicatorを常時表示し、tooltipで「表紙専用画像（閲覧不可）」と分かるようにする。hover / pressed表現は通常cardと同じとする。
+- archiveでもautomatic Cover hintと同じroot / transparent wrapper範囲の `cover.xxx` だけを表紙専用として通常読書pageから除外し、該当階層の内容一覧では通常画像より前へ表示して同じ閲覧不可UIを適用する。それより深い `cover.xxx` は通常画像として扱う。nested archiveの `cover.xxx` は親archiveへ影響せず、そのnested archive自身のroot / wrapper規則で判定する。
+- `cover.xxx` をfile chooser / D&D等でそのfile path自体を明示的に開いた場合だけは、Book page列ではなくその1枚だけのDocumentとして閲覧を許可する。通常画像を明示openした場合は従来どおり親画像フォルダDocumentを開く。
+- 表紙専用 `cover.xxx` を読書pageから除外したことによる既存保存page indexのmigrationは行わない。以後のopen / saveは新しいpage構成を基準とする。
+
+## 本棚の並び替え
+
+- 通常本棚では、並び替え基準として「ファイル名」「更新日時」「作成日時」、方向として「昇順」「降順」を選択できる。デフォルトはファイル名・昇順。
+- 選択値はアプリ全体の `UserSettings` に永続化し、本棚ごとの個別設定は持たない。
+- Folder groupとBook groupは見出しを表示しないまま分離し、同じ並び替え設定を適用する。Book groupではdirect fileと画像Bookフォルダを保存形式で分けず、一つの一覧としてまとめて並べ替える。
+- ファイル名順はnatural sortを使う。更新日時・作成日時はscan時に取得した各ファイル／ディレクトリ自身のfilesystem metadataを使用し、フォルダ配下を再帰走査して日時を算出しない。
+- 日時が同じ項目はファイル名のnatural昇順をtie-breakとする。対象日時を取得できない項目は昇順・降順にかかわらず末尾へ置き、日時不明同士はnatural昇順とする。
+- フォルダカード内部のpreview候補は並び替え設定の影響を受けずnatural sortを維持し、先頭を表表紙、続く候補を背表紙として使用する。
+- 並び替え変更時は保持済みscan結果を再利用して即時再描画し、filesystem再scanや既存Cover cacheの不必要な破棄・再生成を行わない。
+- 並び替えは通常本棚だけを対象とし、検索結果順やarchive内容表示には適用しない。
+
+## 読書進捗
+
+- 読書進捗はdirect file Bookと画像Bookフォルダの両方を対象とし、作品単位の履歴で最後に読んだBookだけに表示する。本棚root直下のdirect fileは互いに独立したDocumentとして扱い、推測で同一作品へ統合しない。
+- 画像Bookフォルダの「フォルダの内容を表示」でその画像DocumentのディレクトリをLibrary表示している間は、同画面内のBookカードへ進捗UI（タイトル色・track・bar）を表示しない。履歴や保存位置は変更せず、親階層へ戻れば通常のBookカード進捗表示へ戻る。画像以外のdirect fileも同画面では同様に非表示とする。
+- direct fileでは履歴の最後のDocument PathとカードのPathが一致する場合、画像Bookフォルダでは履歴の最後のDocument Pathの親がそのフォルダである場合に進捗対象とする。保存済みlogical pageが1ページ目から最終ページまでの正常範囲であることも必要とする。
+- 同一作品の別巻・別画像Bookを読んだ後は以前のBookの進捗表示を外し、最新Bookだけへ進捗を表示する。最新Bookを開く際、作品読了状態でなければ同じ判定で保存pageを再開位置として使用し、読了済みなら保存pageを使わず通常先頭位置から開始する。別Bookの位置は流用しない。
+- 進捗対象ではdirect file Bookのファイル名または画像Bookフォルダのフォルダ名テキストだけを `@accent_color` で表示し、Book Coverの最下端へ高さ5pxの進捗表示を重ねる。全幅のtrackは `alpha(@window_fg_color, 0.15)` 相当、進捗部分はaccent色とし、進捗率に応じた幅を最低5px確保して右端から左方向へ伸ばす。タイトルのfont weight・font sizeは変更せず、進捗テキストやtooltipも追加しない。履歴entryが作品読了状態（`at_document_end == true`）ならタイトルを通常色へ戻し、trackと進捗部分をともに非表示にする。本棚root直下の独立file Bookにも同じ規則を適用する。
+- 現在Documentの末尾到達は保存page番号の単純比較ではなくViewerの表示単位で判定する。Single / Spread、`spread_shift`、横長画像由来のlogical pageを考慮し、たとえば65 logical pagesをSpreadで64–65ページ相当の最終表示まで読んだ場合も現在Document末尾への到達とする。作品単位の `HistoryIdentity::BookshelfWork` では、さらに同じ作品identity配下に次のDocumentが存在しない場合だけ読了として進捗表示を消す。次のDocumentが別作品identity配下なら現在作品の読了判定には含めない。本棚root直下の独立file Bookなど `BookshelfWork` ではないDocumentは現在Document末尾への到達をそのまま読了とする。
+- 読了しても履歴entryと最後に閲覧した保存pageは保持するが、`at_document_end == true` の間はそのpageを途中再開位置として使用しない。本棚・お気に入り・履歴等から再openした場合は通常先頭位置から開始する。末尾から前へ戻って読了状態が解除された場合は、その保存pageを再び再開位置として使用する。
+
+## お気に入り
+
+- お気に入りはUserSettingsや履歴から独立した `FavoritesStore` と専用INIへ永続化し、追加順は新しい項目を先頭とする。閲覧しただけでは順序を変更しない。
+- identityはAgnamのDocument単位とする。archive等はfile pathを `FileDocument`、filesystem画像群は親フォルダpathを `ImageFolderDocument` として保持する。同一フォルダ内の複数画像は1件のお気に入りへ正規化する。
+- 旧path-only形式を読み込む場合、画像pathは親フォルダidentityへ正規化して重複排除し、file Documentはそのまま維持する。
+- navigation drawerのお気に入り一覧は解決済みCoverと、identityから表示時に導出した作品名 / Document名をcompact rowで表示する。作品内のfile Documentは親folder名を作品名、拡張子を含むfile名をDocument名とし、巻名規則に一致する画像Bookは親folder名を作品名、画像Book folder名をDocument名とする。本棚root直下の独立Documentや作品名とDocument名が同一になる画像Bookは重複する2行目を表示しない。表示用の作品名をidentityや永続形式へ混ぜず、Document単位identityを維持する。各rowはクリックで開き、右クリックから個別削除できる。
+- お気に入り一覧はrecycling可能なvirtualized rowとして表示し、全entry分のGTK WidgetやCover Textureを常時保持しない。Cover需要はrealized / visible付近のrowに限定し、rowのunbind時はpaintableを解除する。非同期結果は現在bind中のidentityと一致する場合だけ反映する。
+- 通常本棚のBookカードでは、お気に入り登録済みのdirect file / 画像BookフォルダのCover実画像右上へ状態表示専用のマークを重ねる。24pxの円形半透明背景に12pxの `starred-symbolic` を中央配置し、実画像の上端・右端から4px内側へ置く。Coverのaspect ratioに追従し、Texture取得前または取得失敗時は表示しない。画像Bookの「フォルダの内容を表示」画面、container / seriesフォルダ、検索、履歴、お気に入りdrawerにはこのマークを追加せず、マーク自体はクリック対象にしない。お気に入り追加・削除時は右クリック文言とマークを即時同期する。
+- Cover生成・disk cacheは本棚と共通のCover resolutionを再利用し、manual / automaticの現在状態を反映する。identityのfolder pathを画像sourceとして直接渡さない。
+- お気に入りを開く際は同じDocument / 画像folderに属する履歴の保存pageだけを再開位置として使用し、別folder / 別巻の履歴位置を流用しない。ただし履歴が作品読了状態なら保存pageを使わず通常先頭位置から開始する。画像folderのentry point解決はbackgroundで行う。
+- お気に入り対象が削除された、または画像folderから対応画像がなくなった場合も自動削除しない。「お気に入りを開けません」Dialogから明示的に削除できるようにする。
+- お気に入りpanelが非表示の間は専用Cover jobを休止し、再表示時にresumeする。追加・削除時は本棚cardの右クリック文言と開いているお気に入りpanelを同期する。
+
+## breadcrumb
+
+- HeaderBar左側に本棚rootから現在位置までの各segmentをフラットな独立項目として表示し、小さい右向きchevronで区切る。
+- rootはtooltip「本棚トップ」を持つhome iconで表示する。下位階層ではクリックで本棚rootへ移動し、本棚rootではtargetのない現在位置として自己navigationを起こさない。Viewerのfile Documentがroot配下なら親Library階層から本棚へ戻れ、root外なら本棚rootへの入口とファイル名だけを表示する。
+- 画像BookをViewerで表示している場合、entry pointや現在pageの画像ファイル名はbreadcrumbへ表示せず、画像Bookフォルダ自体を末尾の現在地として表示する。例: `home > ブラックジャック > 01巻`。末尾の画像Bookフォルダはnon-clickableで、ページ移動してもbreadcrumbは変化しない。
+- archive内容表示ではroot archive、内部folder、nested archiveを同じbreadcrumbへ論理的に積み、filesystem上の一時展開pathを表示しない。railの上位移動はbreadcrumbで現在位置の直前にあるsegment targetへ進み、既存のarchive navigation semanticsを使う。
+- 移動先を持つsegmentだけhover背景を持つ。現在位置はnon-clickable。
+- clickable segmentのhit areaを見た目のsegment領域より周囲へ広げない。rootもHeaderBar左端まで拡張しない。
+- clickable segmentはマウス操作専用とし、Tab focus対象にしない。
+- 幅不足時もrootとseparatorを維持し、短いsegmentの自然幅をなるべく保ちながら長い名前を優先して末尾省略する。各名前はtooltipで全文確認可能。
+- 極端な深階層向けのcollapse UIは現時点の目的としない。
+
+## 本棚Cover thumbnailとdisk cache
+
+- GTK/App非依存のCover生成・永続disk cacheを使用する。通常本棚用thumbnailは最大468×312pxとし、3:2より横長のsourceだけ中央を3:2へ左右cropしてから最大寸法へ縮小する。3:2以下は元のaspect ratioを維持し、いずれも小画像は拡大しない。
+- 自動生成cacheはGLib標準ユーザーcache directory配下 `agnam/bookshelf/auto` に置く。
+- 本棚root scan snapshotは同じuser cache配下 `agnam/bookshelf/scan-snapshots`、archive viewable-content probe cacheは `agnam/bookshelf/archive-probes` に置く。いずれもformat versionを検証し、破損・version不一致はcache missとして扱う。書込みは一時fileからのatomic renameを使い、cacheの読み書き失敗だけで本棚機能を失敗させない。
+- cacheはPath key、source size・mtime、cache format version等を検証する。破損・source更新・version不一致はmissとして再生成する。
+- cache書込みは一時ファイルからのrenameとmetadataの最後書込みを維持する。
+- automatic Coverは画像Bookの直下 `cover.xxx`、archiveのroot / transparent wrapper `cover.xxx` を優先し、hintがなければ通常の自然順先頭画像を使う。manual overrideがある場合はmanual sourceを優先する。
+- 本棚・検索・履歴・お気に入りは同じdisk cache / Cover生成処理を再利用できるが、各表示scopeのgeneration・pending・active・Texture stateは分離する。検索・履歴・お気に入りは最大72×100pxへbackgroundで追加縮小し、本棚用disk thumbnailと通常本棚の表示寸法は変更しない。
+- 検索のdecoded Cover Textureは既知のRGB pixel backingを8MiB soft-budget LRUで管理する。現在visibleなTextureを優先保持し、visible分だけでbudgetを超える場合だけ一時超過を許容する。eviction時はoffscreen rowのpaintable参照も解除し、同じsourceが再びvisibleになればready履歴を解除してdisk cache load / generation経路へ戻す。
+- 通常filesystem本棚のdecoded `GdkTexture` はsource path + `ThumbnailSourceKind`をidentityとする全ancestor chain共通LRUで再利用し、backing pixel memoryのsoft budgetを64MiBとする。現在visibleなTextureはpinしてevictせず、visibleだけでbudgetを超える場合のみ一時超過を許容する。画面外の古いTextureや離れたchild branch専用Textureはevictし、現在Widgetがpaintable参照を持つ場合も外して実体を解放可能にする。archive内容表示用Textureは通常本棚とは独立した64MiB LRUとし、一度生成した最大468×312px thumbnailをXDG user cache配下のsession backingへlossless保存する。eviction後はこのbackingから復元し、Sequential archiveをTexture再表示のために再展開しない。backingを利用できないsessionでは再展開回避を優先してLRU evictionを停止する。
+- visible demandに基づきoffscreen sourceを無条件にqueueへ積まない。scroll・resizeで需要を再評価する。
+- cache lookup/loadは最大8件、cache miss後の生成は最大2件を基本とする。source path + `ThumbnailSourceKind`単位で重複実行を抑え、generationでstale結果を排除する。
+- 本棚・検索・履歴・お気に入りのCover生成は各scopeのgeneration更新時に旧jobへcancelを通知する。source読込・codec decode・crop/resizeの実行中は中断せず、前後の安全な境界で終了する。旧jobは終了Msgまで物理worker slotを占め、cancel結果は失敗表示にしない。cache書込み開始後は途中cancelせず、cover PNGの後にmetadataをatomic writeする。
+- cache hitは描画frame単位でまとめて反映し、生成成功は80ms quietまたは最初の到着から240ms maximum latencyでbatch反映する。
+- cacheなしの新directory初回表示ではscrollerをopacity 0のままWidget treeへ配置し、最初のvisible demandのcache lookup一巡または100msの早い方でcache hitを反映して即時revealする。cache miss後の生成完了は待たない。cached directory再訪ではscrollerを隠さず保持済みscan結果とTextureを即表示し、不足しているvisible Textureだけをdisk cache / generationから補う。
+- JPEG thumbnailはTurboJPEGの縮小decodeを利用する。3:2 crop対象では概念上のcrop後寸法を基準に縮小率を選び、最終crop / resize後も不要なupscaleを行わない。PNG / WebPはJPEGより生成costが高く、大画像を多数含むarchive内容表示では全thumbnailが揃うまで時間がかかる場合があるが、PC負荷を抑えるため積極的な並列decodeは行わない。
+- Sequential archive内容のprogressive thumbnail生成中も、生成済みsession backingへのvisible cache loadは許可する。backing missから別のarchive generationは開始せず、forward streamが該当entryへ到達するのを待つ。progressive完了後は通常のgeneration fallbackを再び許可する。
+
+## 本棚検索
+
+- 検索はLibrary / Viewer共通の左navigation drawer内に表示する。開始は左railの検索buttonまたは `<Primary>f`。本棚root未設定時は検索Actionを無効にする。
+- Viewerから検索を開いてもViewer表示・現在Document・現在pageを変更しない。検索結果から画像Bookフォルダを選んだ場合はViewerで直接開き、同じ画像フォルダの保存済み読書位置があり作品読了状態でなければ再開する。読了済みなら保存pageを使わずentry pointから開始する。container / seriesフォルダを選んだ場合だけLibraryへ移動し、archive / file Documentは既存の共通load経路でViewerへ開く。
+- 検索対象は常に設定済み本棚root全体。任意のサブフォルダやViewerから開始しても `LibraryState::current_directory` は検索開始だけでは変更しない。
+- 初回開始時に `SearchIndex` をbackground構築し、同じ本棚rootである限りdrawer closeやSearch→History / Favorites切替では破棄しない。query変更でもfilesystemを再走査しない。本棚root変更時に完全resetする。
+- `SearchIndex` 構築時はarchive / fileを1 Document、filesystem画像群は各画像Book folderにつき自然順先頭の画像entry 1件をlogical Documentとして収集し、画像pageごとに作品分類やdirectory再走査を繰り返さない。作品分類には履歴の `HistoryIdentity::BookshelfWork` と同じGTK非依存規則を再利用し、作品ごとに自然順の代表Document 1件をCover sourceとして保持する。
+- `SearchIndex` は検索metadataの唯一の所有元とし、queryごとの結果はIndex内itemへの小さいhandleだけを保持してmetadataを複製しない。
+- `SearchIndex` のarchive有効性判定は通常本棚scanと同じpersistent viewable-content probe cacheを再利用し、path・size・mtimeが変わらないarchiveを検索index構築のためだけに再probeしない。
+- drawer closeは検索session終了ではなく表示休止とする。query、SearchEntry、SearchIndex、検索結果、結果Widget、bounded Texture cache、失敗状態、scroll位置を保持し、再open時は既存表示を再利用する。
+- 検索drawerが非表示の間はvisible thumbnail demandを停止し、再表示時に可視rowだけ再評価する。LRUに残るTextureは保持し、eviction済みのvisible sourceは再取得する。
+- 検索項目はfilesystem項目そのものではなく「読む作品」単位とする。本棚root配下の作品folderは履歴の `BookshelfWork` 規則で1件にまとめ、作品内部のarchive巻・画像Book巻や、それらをまとめる中間containerは独立した検索結果にしない。本棚root直下の対応Documentは独立作品として検索結果に残し、数字stemだけを理由に除外しない。作品folderが直下画像を持つ画像BookならViewerへ直接openするentry pointを保持する。
+- queryと項目名はUnicode NFKC、lowercase、カタカナ→ひらがな、Unicodeの文字・数字だけを残す処理で正規化し、部分一致検索する。
+- 検索結果はdrawer内の縦1列のcompact rowとして「フォルダ」「ファイル」セクションに分ける。作品folderは左に代表Cover 1枚、右に作品名と親relative pathを表示し、root直下の独立Documentは同じ1枚Cover形式でファイルsectionへ表示する。row全体を選択可能とし、長い文字列はellipsizeする。
+- 構築中、失敗、0件は同じdrawer領域へ専用stateを表示する。検索結果の順序には通常本棚の並び替え設定を適用しない。
+- 検索結果を選択してdrawerを閉じても検索状態は保持し、再度開けば直前のquery / resultsへ戻れる。本棚root変更時だけ検索session、thumbnail session、Widget表示状態、保存scroll位置を完全resetする。
+- 検索Coverは本棚と同じdisk cacheとCover resolutionを再利用するが、scheduler・generation・pending・active・Texture cacheは通常本棚／履歴／お気に入りから分離する。
+
+## 起動復元
+
+- 本棚root未設定なら起動時動作より優先して案内とフォルダ選択導線を出す。
+- root設定済みでは `BookshelfTop` なら本棚トップをbackground scanし、`RestoreLastSession` かつ完全なsession情報があれば既存Document load経路で非同期復元する。
+- 本棚トップへ入る際、rootが現在利用可能かつ有効なroot snapshotがあればfresh scan完了前に前回本棚を即表示する。snapshot表示後もbackground fresh scanを継続し、同一なら保持、差分があれば自動更新する。rootが利用不能な場合は古いsnapshotを表示しない。
+- sessionなし／復元失敗では本棚トップへfallbackし、復元失敗だけを理由にsessionを削除しない。
+- 設定済みrootが読めなくても設定値は消去せず、エラーと別フォルダ選択導線を表示する。
+- Viewerの現在位置はDocument pathとlogical page indexのsnapshotとしてmemory更新し、ページ移動ごとにはdisk保存しない。Document load成功時、通常終了時、他設定保存時にsettings.iniへ保存する。
