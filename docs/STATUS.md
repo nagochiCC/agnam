@@ -41,6 +41,8 @@ AgnamはRust + GTK4 / libadwaitaで実装している漫画・画像Viewerであ
 
 ## Verification / known constraints
 
+- v0.9.0の固定ソースからUbuntu 24.04基準のAppImageと対応ソースを生成する `packaging/appimage/` とActions workflowを備える。最終候補のActions全工程、Debian 13非GUI検証、対応ソースからのlibrary / runtime再ビルド・再リンク、通知一式の整合確認が完了した。Arch実機で日本語IME・表示・file chooserと起動警告の解消を確認済み。外部媒体操作は前候補で確認済み。Issue #1の配布可否調査は完了し、GitHub Release用artifactとして採用可能と判断した。公開は別作業（[最終検証記録](research/issue-1-appimage-release-build.md#最終actions候補の採用判断)）。
+
 - current source of truth上、repository全体を塞ぐ未解決verification blockerは記録していない。個々の実装・GUI確認・検証runはGitHub Issuesで追跡し、current behaviorに影響する確定結果だけdocsへ反映する。
 - nested archiveには再帰上限があり、安全な処理のため一時directoryを使う場合がある。
 - JPEG thumbnailはTurboJPEG / libjpeg-turboを使用し、現在のbuild構成では `pkg-config` から検出できる `libturbojpeg` とSIMD supportを前提とする。

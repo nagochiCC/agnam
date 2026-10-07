@@ -61,4 +61,6 @@ cargo build --release --locked
 
 ## Development documentation
 
+AppImageの正式候補を生成する手順は [`packaging/appimage/README.md`](packaging/appimage/README.md) を参照してください。
+
 開発時のcurrent source of truthは [`docs/README.md`](docs/README.md) を入口として参照してください。

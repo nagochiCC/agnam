@@ -1,0 +1,18 @@
+--- a/src/app/mod.rs
++++ b/src/app/mod.rs
+@@ -147,12 +147,12 @@
+ const NAVIGATION_DRAWER_WIDTH_FRACTION: f64 = 0.3;
+ const APP_CSS: &str = r#"
+ .navigation-rail {
+-    background-color: var(--sidebar-bg-color);
+-    color: var(--sidebar-fg-color);
++    background-color: @sidebar_bg_color;
++    color: @sidebar_fg_color;
+ }
+ 
+ window:backdrop .navigation-rail {
+-    background-color: var(--sidebar-backdrop-color);
++    background-color: @sidebar_backdrop_color;
+ }
+ 
+ .loading-overlay {

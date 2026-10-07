@@ -1,0 +1,129 @@
+{
+  "ubuntu_image": "ubuntu@sha256:f610ab94648195aa356059f5b41d6085c9d4d903c072430cdd1af7bdb646106b",
+  "ubuntu_snapshot": "20261004T000000Z",
+  "rust": "1.97.1",
+  "agnam_commit": "c5bddcac92995816f0f0cb212db8b11dadf52c2d",
+  "runtime_commit": "8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa",
+  "sources": {
+    "agnam": {
+      "file": "v0.9.0.tar.gz",
+      "url": "https://github.com/nagochiCC/agnam/archive/refs/tags/v0.9.0.tar.gz",
+      "sha256": "aac6269c7621efe565d1a639f790f60acf3e40bb115f60802a4befa47f6301dc"
+    },
+    "turbo": {
+      "file": "libjpeg-turbo-3.2.0.tar.gz",
+      "url": "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.2.0/libjpeg-turbo-3.2.0.tar.gz",
+      "sha256": "6f30092cef9fb839779646608f4ee14ae3cbac989c47fa05e841b0841f09878e"
+    },
+    "cairo": {
+      "file": "cairo-1.18.6.tar.xz",
+      "url": "https://cairographics.org/releases/cairo-1.18.6.tar.xz",
+      "sha256": "1c767308174337a74694da0f3ec069c271452163a1ef4540964c50c301f157d4"
+    },
+    "runtime": {
+      "file": "runtime-source.tar.gz",
+      "url": "https://api.github.com/repos/AppImage/type2-runtime/tarball/8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa",
+      "sha256": "14a69c8d4cf29c63d12e4d2bb44cdd6d7b916d1b8fc38a1f1525077e8505e377"
+    },
+    "fuse": {
+      "file": "fuse-3.15.0.tar.xz",
+      "url": "https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz",
+      "sha256": "70589cfd5e1cff7ccd6ac91c86c01be340b227285c5e200baa284e401eea2ca0"
+    },
+    "squashfuse": {
+      "file": "squashfuse-0.5.2.tar.gz",
+      "url": "https://github.com/vasi/squashfuse/archive/0.5.2.tar.gz",
+      "sha256": "db0238c5981dabbd80ee09ae15387f390091668ca060a7bc38047912491443d3"
+    },
+    "musl": {
+      "file": "musl-1.2.5.tar.gz",
+      "url": "https://musl.libc.org/releases/musl-1.2.5.tar.gz",
+      "sha256": "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4"
+    },
+    "zstd": {
+      "file": "zstd-1.5.6.tar.gz",
+      "url": "https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz",
+      "sha256": "8c29e06cf42aacc1eafc4077ae2ec6c6fcb96a626157e0593d5e82a34fd403c1"
+    },
+    "zlib": {
+      "file": "zlib-1.3.2.tar.xz",
+      "url": "https://zlib.net/zlib-1.3.2.tar.xz",
+      "sha256": "d7a0654783a4da529d1bb793b7ad9c3318020af77667bcae35f95d0e42a792f3"
+    },
+    "mimalloc": {
+      "file": "mimalloc-2.1.7.tar.gz",
+      "url": "https://api.github.com/repos/microsoft/mimalloc/tarball/8c532c32c3c96e5ba1f2283e032f69ead8add00f",
+      "sha256": "cd1f9bbfde2687b23bfe3d2e4814e293be093529f39ecc55d1a7deb643b27757"
+    },
+    "tiff-dsc": {
+      "file": "tiff_4.5.1+git230720-4ubuntu2.5.dsc",
+      "url": "https://snapshot.ubuntu.com/ubuntu/20261004T000000Z/pool/main/t/tiff/tiff_4.5.1+git230720-4ubuntu2.5.dsc",
+      "sha256": "46e2765124bce104413733352d548117c5e9cee73953758a2040df613f3d6b9c"
+    },
+    "tiff-orig": {
+      "file": "tiff_4.5.1+git230720.orig.tar.xz",
+      "url": "https://snapshot.ubuntu.com/ubuntu/20261004T000000Z/pool/main/t/tiff/tiff_4.5.1+git230720.orig.tar.xz",
+      "sha256": "0e51bcf3a3ffa5fc76ea6aeb74a797f95c84544fcc8b6a1ec5def967a78e9e12"
+    },
+    "tiff-debian": {
+      "file": "tiff_4.5.1+git230720-4ubuntu2.5.debian.tar.xz",
+      "url": "https://snapshot.ubuntu.com/ubuntu/20261004T000000Z/pool/main/t/tiff/tiff_4.5.1+git230720-4ubuntu2.5.debian.tar.xz",
+      "sha256": "e3106320d41790b741b0db9a7fccf72b6a8d425743b6407e9a9dd369d958be76"
+    },
+    "rustc": {
+      "file": "rustc-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-07-16/rustc-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "9819d0a32d56bd339585319c80260e332779f5541fd66838ab7e016d6c814819"
+    },
+    "cargo": {
+      "file": "cargo-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-07-16/cargo-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "e1be5f5ff7f7f80ca506fb65770b759edbdc6d303781ed71c5de8ec8a8394779"
+    },
+    "rust-std": {
+      "file": "rust-std-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-07-16/rust-std-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "1c1e704ae80126b7de34f72ea2825f7fd01736dec20732faed47374b95282fba"
+    },
+    "rust-src": {
+      "file": "rust-src-1.97.1.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-07-16/rust-src-1.97.1.tar.xz",
+      "sha256": "e9a1e616d04c6845895c827a178b9227f7c7199f3f4a80af81ab3aff7b80156b"
+    },
+    "rust-docs": {
+      "file": "rust-docs-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-07-16/rust-docs-1.97.1-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "3a4cd08766d1648363a13a3a52cf8462774c9f10be0a9270b70fdc299472b896"
+    },
+    "librsvg-stdlib-copyright": {
+      "file": "rust-1.75.0-COPYRIGHT",
+      "url": "https://raw.githubusercontent.com/rust-lang/rust/1.75.0/COPYRIGHT",
+      "sha256": "bd0581fef622b3d8b25836cf70feb7e1a7a6171ea9e440b46dfda74c46a0ed0d"
+    },
+    "librsvg-stdlib-license-mit": {
+      "file": "rust-1.75.0-LICENSE-MIT",
+      "url": "https://raw.githubusercontent.com/rust-lang/rust/1.75.0/LICENSE-MIT",
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+    },
+    "librsvg-stdlib-license-apache": {
+      "file": "rust-1.75.0-LICENSE-APACHE",
+      "url": "https://raw.githubusercontent.com/rust-lang/rust/1.75.0/LICENSE-APACHE",
+      "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+    },
+    "fontconfig-dsc": {
+      "file": "fontconfig_2.15.0-1.1ubuntu2.dsc",
+      "url": "https://snapshot.ubuntu.com/ubuntu/20261004T000000Z/pool/main/f/fontconfig/fontconfig_2.15.0-1.1ubuntu2.dsc",
+      "sha256": "3bf8ffe75d6932ba542646c6816b769d49f90c673bbd4ebc728e0e9622bcce0f"
+    },
+    "fontconfig-orig": {
+      "file": "fontconfig_2.15.0.orig.tar.xz",
+      "url": "https://snapshot.ubuntu.com/ubuntu/20261004T000000Z/pool/main/f/fontconfig/fontconfig_2.15.0.orig.tar.xz",
+      "sha256": "63a0658d0e06e0fa886106452b58ef04f21f58202ea02a94c39de0d3335d7c0e"
+    },
+    "fontconfig-debian": {
+      "file": "fontconfig_2.15.0-1.1ubuntu2.debian.tar.xz",
+      "url": "https://snapshot.ubuntu.com/ubuntu/20261004T000000Z/pool/main/f/fontconfig/fontconfig_2.15.0-1.1ubuntu2.debian.tar.xz",
+      "sha256": "29ebacc2cd8f2d336150b3895feea8bb35e4340f7a34dfb37d915be76fb36b91"
+    }
+  }
+}
