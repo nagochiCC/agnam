@@ -16,7 +16,7 @@
 ユーザーが実機確認し、IM module / mountinfo警告は再現していない。
 Fontconfig / CSS互換修正後の最終run `37574815351` も全工程成功し、その候補のArch実機GUIと
 通知・対応ソースの最終確認が完了した。**AppImage v0.9.0はGitHub Release用artifactとして採用可能**と判断する。
-Issue #1の配布可否調査に未解決blockerはない。branch統合は完了済みで、公開は別作業である。
+Issue #1の配布可否調査に未解決blockerはない。branch統合とGitHub Release v0.9.0での公開まで完了している。
 最終候補の識別情報と確認範囲は下記に記録し、過去のローカル実証のchecksumとは区別する。
 
 前回の `/tmp/agnam-license-audit-cmTmqi/REPORT.ja.md`、component/file/ELF/crate台帳と
@@ -75,6 +75,19 @@ current仕様のsingle entry 64 MiB制限による正常拒否であり、AppIma
 安全制限、IME探索、theme/backend、XDG保存先、mount monitoringを変更しない。
 この採用判断は確認済み環境と既存の互換性条件に基づく。全distribution / 将来のhost moduleの保証や、
 全AppImageのビット単位再現性の保証とは区別する。
+
+## GitHub Release公開
+
+最終検証済み成果物は [GitHub Release v0.9.0](https://github.com/nagochiCC/agnam/releases/tag/v0.9.0) で公開した。
+Releaseはdraft / prereleaseではなく、tag `v0.9.0` に対する通常Releaseである。
+公開assetは次の4点で、GitHub Release APIのasset digestも最終検証値と一致した。
+
+- `Agnam-0.9.0-x86_64.AppImage`: SHA-256 `d2b76662d36729966a3ca72b5e0dd6337a4b8853d30c68dc46a696ab46fbaebc`
+- `Agnam-0.9.0-x86_64.AppImage.sha256`
+- `Agnam-0.9.0-AppImage-corresponding-source.tar.xz`: SHA-256 `b4c7f7fceba8dd503f0e32d3e5db3733178a72c673ec970692227216fb149c4e`
+- `Agnam-0.9.0-AppImage-corresponding-source.tar.xz.sha256`
+
+GitHubが自動生成する `Source code (zip)` / `Source code (tar.gz)` は、上記の対応ソースarchiveとは別物として扱う。
 
 ## 固定した入力
 
