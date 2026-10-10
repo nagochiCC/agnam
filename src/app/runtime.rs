@@ -139,10 +139,12 @@ impl App {
 
     pub(super) fn refresh_textures(&mut self) -> bool {
         let preparation = self.viewer.smart_crop.handle();
-        (self.viewer.right_texture, self.viewer.left_texture) = self
-            .viewer
-            .session
-            .current_textures_with_preparation(self.settings.smart_crop, Some(&preparation));
+        (self.viewer.right_texture, self.viewer.left_texture) =
+            self.viewer.session.current_textures_with_preparation(
+                self.settings.archive_expansion_limit,
+                self.settings.smart_crop,
+                Some(&preparation),
+            );
         self.viewer.session.take_archive_resource_limit().is_some()
     }
 

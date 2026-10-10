@@ -24,9 +24,9 @@ impl App {
             self.render_library_search_results(sender);
         }
         let jobs = self.navigation.history_view.invalidate_cover_textures();
-        Self::spawn_history_cover_jobs(jobs, sender);
+        Self::spawn_history_cover_jobs(self.settings.archive_expansion_limit, jobs, sender);
         let jobs = self.navigation.favorites_view.invalidate_cover_textures();
-        Self::spawn_favorites_cover_jobs(jobs, sender);
+        Self::spawn_favorites_cover_jobs(self.settings.archive_expansion_limit, jobs, sender);
         self.mark_history_panel_dirty(sender);
         self.mark_favorites_panel_dirty(sender);
     }
@@ -194,6 +194,7 @@ impl App {
             return;
         }
 
+        let limit = self.settings.archive_expansion_limit;
         let request = self.library.archive.begin(location);
         self.close_navigation_panel(sender);
         self.invalidate_document_boundary();
@@ -209,15 +210,20 @@ impl App {
         self.refresh_breadcrumb(sender);
         let sender = sender.clone();
         spawn_background(move || {
-            let result =
-                crate::archive::ArchiveContentLevel::open(request.location).map_err(|error| {
-                    match error {
-                        crate::error::AppError::ArchiveResourceLimit(_) => {
-                            super::document_workflow::ARCHIVE_RESOURCE_LIMIT_MESSAGE.into()
-                        }
-                        error => error.to_string(),
-                    }
-                });
+            let result = crate::archive::ArchiveContentLevel::open_with_cancel(
+                limit,
+                request.location,
+                &request.cancel,
+            )
+            .map_err(|error| match error {
+                crate::error::AppError::ArchiveResourceLimit(_) => {
+                    super::document_workflow::ARCHIVE_RESOURCE_LIMIT_MESSAGE.into()
+                }
+                error => error.to_string(),
+            });
+            if request.cancel.is_cancelled() {
+                return;
+            }
             sender.input(Msg::ArchiveContentsLoaded {
                 request_id: request.id,
                 result,
@@ -250,6 +256,7 @@ impl App {
             {
                 let token = self.library.archive.begin_progressive_thumbnails();
                 Self::spawn_progressive_archive_content_thumbnails(
+                    self.settings.archive_expansion_limit,
                     request_id,
                     archive,
                     root_archive,
@@ -266,6 +273,7 @@ impl App {
     }
 
     fn spawn_progressive_archive_content_thumbnails(
+        limit: crate::archive::ArchiveExpansionLimit,
         session_id: u64,
         archive: PathBuf,
         root_archive: PathBuf,
@@ -280,6 +288,7 @@ impl App {
             let progress_sender = sender.clone();
             let progress_token = token.clone();
             let result = crate::archive::stream_sequential_archive_images(
+                limit,
                 &archive,
                 &token,
                 move |image| {
@@ -498,6 +507,7 @@ impl App {
                 });
             });
         }
+        let limit = self.settings.archive_expansion_limit;
         for job in jobs.generations {
             let cancel = self.library.thumbnails.cancellation_token();
             let archive_source = (job.kind == ThumbnailSourceKind::ArchiveEntry)
@@ -507,7 +517,7 @@ impl App {
             spawn_background(move || {
                 let result = match job.kind {
                     ThumbnailSourceKind::BookCover => {
-                        generate_and_cache_bookshelf_thumbnail_with_cancel(&job.source, &|| cancel.cancelled())
+                        generate_and_cache_bookshelf_thumbnail_with_cancel(limit, &job.source, &|| cancel.cancelled())
                             .map_err(|error| error.to_string())
                     }
                     ThumbnailSourceKind::DirectImage => {
@@ -527,7 +537,7 @@ impl App {
                             }
                             let bytes = source
                                 .reader
-                                .read(&source.entry)
+                                .read_with_cancel(limit, &source.entry, &|| cancel.cancelled())
                                 .map_err(|error| error.to_string())?;
                             let thumbnail = crate::bookshelf::thumbnail::generate_from_bytes(&bytes)
                                 .map_err(|error| error.to_string())?;

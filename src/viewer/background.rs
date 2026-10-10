@@ -78,6 +78,7 @@ enum Command {
     CancelThumbnails {
         document_generation: u64,
     },
+    SetArchiveExpansionLimit(crate::archive::ArchiveExpansionLimit),
     SetThumbnailGenerationSpeed(ThumbnailGenerationSpeed),
 }
 
@@ -411,6 +412,10 @@ impl ViewerBackgroundScheduler {
             }));
     }
 
+    pub(crate) fn set_archive_expansion_limit(&self, limit: crate::archive::ArchiveExpansionLimit) {
+        let _ = self.commands.send(Command::SetArchiveExpansionLimit(limit));
+    }
+
     pub(crate) fn set_thumbnail_generation_speed(&self, speed: ThumbnailGenerationSpeed) {
         let _ = self
             .commands
@@ -425,6 +430,7 @@ struct BackgroundLane<F> {
     thumbnail_worker: Option<(ThumbnailToken, ThumbnailWorker)>,
     preload_loader: ThumbnailImageLoader,
     thumbnail_generation_speed: ThumbnailGenerationSpeed,
+    archive_expansion_limit: crate::archive::ArchiveExpansionLimit,
     preparation: Option<super::preparation::SmartCropPreparationHandle>,
 }
 
@@ -444,6 +450,7 @@ where
             thumbnail_worker: None,
             preload_loader: ThumbnailImageLoader::new(),
             thumbnail_generation_speed,
+            archive_expansion_limit: Default::default(),
             preparation: None,
         }
     }
@@ -562,6 +569,10 @@ where
                     self.thumbnail_worker = None;
                 }
             }
+            Command::SetArchiveExpansionLimit(limit) => {
+                // Commands run between jobs; an in-flight read keeps its own budget.
+                self.archive_expansion_limit = limit;
+            }
             Command::SetThumbnailGenerationSpeed(speed) => {
                 self.thumbnail_generation_speed = speed;
             }
@@ -583,7 +594,9 @@ where
     }
 
     fn run_preload(&mut self, document_generation: u64, request: PreloadRequest) -> bool {
-        let bytes = self.preload_loader.load_image_bytes(&request.source);
+        let bytes = self
+            .preload_loader
+            .load_image_bytes(self.archive_expansion_limit, &request.source);
         if !self.drain_commands() {
             return false;
         }
@@ -633,9 +646,12 @@ where
             return true;
         }
 
-        worker.run_demand(asset_id, bytes, &mut |result| {
-            (self.emit)(ViewerBackgroundResult::Thumbnail(result))
-        }) != DemandThumbnailStep::OutputClosed
+        worker.run_demand(
+            self.archive_expansion_limit,
+            asset_id,
+            bytes,
+            &mut |result| (self.emit)(ViewerBackgroundResult::Thumbnail(result)),
+        ) != DemandThumbnailStep::OutputClosed
     }
 
     fn run_distributed_thumbnail(&mut self, token: ThumbnailToken) -> BackgroundStep {
@@ -649,8 +665,9 @@ where
         }
 
         let started = Instant::now();
-        match worker.run_next(&mut |result| (self.emit)(ViewerBackgroundResult::Thumbnail(result)))
-        {
+        match worker.run_next(self.archive_expansion_limit, &mut |result| {
+            (self.emit)(ViewerBackgroundResult::Thumbnail(result))
+        }) {
             ThumbnailStep::More => BackgroundStep::Pace(started.elapsed()),
             ThumbnailStep::Finished => {
                 self.controller.finish_distributed(token);
@@ -783,6 +800,63 @@ mod tests {
             lane.controller.next_job(),
             Some(NextJob::DistributedThumbnail(_))
         ));
+    }
+
+    #[test]
+    fn expansion_limit_change_preserves_pending_jobs_and_archive_reader() {
+        use crate::archive::ArchiveExpansionLimit;
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("book.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+        writer
+            .start_file("page.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"image bytes").unwrap();
+        writer.finish().unwrap();
+        let source = ImageSource::ArchiveEntry {
+            archive_path,
+            entry_index: 0,
+            entry_name: "page.png".into(),
+        };
+        let (commands, receiver) = mpsc::channel();
+        let mut lane = BackgroundLane::new(receiver, ThumbnailGenerationSpeed::Low, |_| true);
+        lane.controller.activate_document(4);
+        lane.controller.replace_thumbnail(thumbnail(4, 8));
+        assert_eq!(
+            lane.preload_loader
+                .load_image_bytes(lane.archive_expansion_limit, &source)
+                .unwrap()
+                .as_ref(),
+            b"image bytes"
+        );
+        commands
+            .send(Command::SetArchiveExpansionLimit(
+                ArchiveExpansionLimit::GiB16,
+            ))
+            .unwrap();
+        assert!(lane.wait_for_pacing(Duration::from_secs(60)));
+        assert_eq!(lane.archive_expansion_limit, ArchiveExpansionLimit::GiB16);
+        assert_eq!(lane.preload_loader.archive_open_count, 1);
+        assert!(matches!(
+            lane.controller.next_job(),
+            Some(NextJob::DistributedThumbnail(_))
+        ));
+        commands
+            .send(Command::SetArchiveExpansionLimit(
+                ArchiveExpansionLimit::GiB2,
+            ))
+            .unwrap();
+        assert!(lane.drain_commands());
+        assert_eq!(lane.archive_expansion_limit, ArchiveExpansionLimit::GiB2);
+        assert_eq!(
+            lane.preload_loader
+                .load_image_bytes(lane.archive_expansion_limit, &source)
+                .unwrap()
+                .as_ref(),
+            b"image bytes"
+        );
+        assert_eq!(lane.preload_loader.archive_open_count, 1);
     }
 
     #[test]

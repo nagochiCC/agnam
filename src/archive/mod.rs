@@ -22,16 +22,20 @@ pub(crate) use content::{
     ArchiveContentItemKind, ArchiveContentLevel, ArchiveEntryReader, ArchiveLocation,
     cover_only_paths,
 };
+#[cfg(test)]
+pub(crate) use cover::load_archive_entry_bytes;
 pub(crate) use cover::{
-    ArchiveEntryLoadError, ArchiveImageId, cover_image_in_folder, load_archive_entry_bytes,
-    load_cover_source_bytes,
+    ArchiveEntryLoadError, ArchiveImageId, cover_image_in_folder,
+    load_archive_entry_bytes_with_cancel, load_cover_source_bytes_with_cancel,
 };
 pub(crate) use format::ArchiveFormat;
+#[cfg(test)]
+pub(crate) use loader::load_document_from_path;
 pub(crate) use loader::{
-    first_direct_image_path, is_image_document_entry_path, load_document_from_path,
+    first_direct_image_path, is_image_document_entry_path, load_document_from_path_with_cancel,
     load_document_from_path_with_sequential_progress, stream_sequential_archive_images,
 };
-pub(crate) use resource::ResourceLimitKind;
+pub(crate) use resource::{ArchiveExpansionLimit, ResourceLimitKind};
 pub(crate) use safety::is_normal_relative_path;
 use std::path::{Path, PathBuf};
 

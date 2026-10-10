@@ -99,6 +99,7 @@ impl StartupBehavior {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UserSettings {
+    pub(crate) archive_expansion_limit: crate::archive::ArchiveExpansionLimit,
     pub(crate) click_mode: ClickMode,
     pub(crate) show_document_boundary_page: bool,
     pub(crate) scale_up: bool,
@@ -123,6 +124,7 @@ pub(crate) struct UserSettings {
 impl Default for UserSettings {
     fn default() -> Self {
         Self {
+            archive_expansion_limit: Default::default(),
             click_mode: ClickMode::default(),
             show_document_boundary_page: true,
             scale_up: true,
@@ -197,6 +199,12 @@ impl UserSettings {
         let key_file = glib::KeyFile::new();
         key_file.load_from_file(path, glib::KeyFileFlags::NONE)?;
         let defaults = Self::default();
+
+        let archive_expansion_limit = key_file
+            .integer(SETTINGS_GROUP, "archive-expansion-limit-gib")
+            .ok()
+            .and_then(crate::archive::ArchiveExpansionLimit::from_gib)
+            .unwrap_or(defaults.archive_expansion_limit);
 
         let click_mode = key_file
             .string(SETTINGS_GROUP, "click-mode")
@@ -310,6 +318,7 @@ impl UserSettings {
             .unwrap_or(defaults.window_maximized);
 
         Ok(Self {
+            archive_expansion_limit,
             click_mode,
             show_document_boundary_page,
             scale_up,
@@ -338,6 +347,11 @@ impl UserSettings {
         }
 
         let key_file = glib::KeyFile::new();
+        key_file.set_integer(
+            SETTINGS_GROUP,
+            "archive-expansion-limit-gib",
+            self.archive_expansion_limit.gib(),
+        );
         key_file.set_integer(SETTINGS_GROUP, "format-version", SETTINGS_FORMAT_VERSION);
         key_file.set_string(
             SETTINGS_GROUP,
@@ -491,12 +505,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn archive_expansion_limits_round_trip_and_invalid_values_use_four_gib() {
+        use crate::archive::ArchiveExpansionLimit;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.ini");
+        for limit in ArchiveExpansionLimit::ALL {
+            let expected = UserSettings {
+                archive_expansion_limit: limit,
+                ..Default::default()
+            };
+            expected.save_to_path(&path).unwrap();
+            assert_eq!(UserSettings::load_from_path(&path).unwrap(), expected);
+            assert!(
+                fs::read_to_string(&path)
+                    .unwrap()
+                    .contains(&format!("archive-expansion-limit-gib={}", limit.gib()))
+            );
+        }
+        for value in [
+            "",
+            "0",
+            "1",
+            "3",
+            "32",
+            "-2",
+            "unlimited",
+            "4 GiB",
+            "4294967296",
+        ] {
+            fs::write(
+                &path,
+                format!("[Settings]\nscale-up=false\narchive-expansion-limit-gib={value}\n"),
+            )
+            .unwrap();
+            let settings = UserSettings::load_from_path(&path).unwrap();
+            assert_eq!(
+                settings.archive_expansion_limit,
+                ArchiveExpansionLimit::GiB4,
+                "{value}"
+            );
+            assert!(!settings.scale_up);
+        }
+        fs::write(&path, "[Settings]\nscale-up=false\n").unwrap();
+        assert_eq!(
+            UserSettings::load_from_path(&path)
+                .unwrap()
+                .archive_expansion_limit,
+            ArchiveExpansionLimit::GiB4
+        );
+    }
+
+    #[test]
     fn defaults_match_the_existing_application_behavior() {
         assert!(!UserSettings::default().header_auto_hide);
         assert!(!UserSettings::default().smart_crop);
         assert_eq!(
             UserSettings::default(),
             UserSettings {
+                archive_expansion_limit: crate::archive::ArchiveExpansionLimit::GiB4,
                 click_mode: ClickMode::default(),
                 show_document_boundary_page: true,
                 scale_up: true,
@@ -533,6 +599,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested/settings.ini");
         let expected = UserSettings {
+            archive_expansion_limit: crate::archive::ArchiveExpansionLimit::GiB8,
             click_mode: ClickMode::AreaBased,
             show_document_boundary_page: false,
             scale_up: true,
@@ -716,6 +783,7 @@ mod tests {
         assert_eq!(
             UserSettings::load_or_default_from_path(&path),
             UserSettings {
+                archive_expansion_limit: crate::archive::ArchiveExpansionLimit::GiB4,
                 click_mode: ClickMode::AreaBased,
                 show_document_boundary_page: true,
                 scale_up: true,

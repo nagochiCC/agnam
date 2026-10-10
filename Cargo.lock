@@ -27,6 +27,7 @@ dependencies = [
  "turbojpeg",
  "unicode-normalization",
  "unrar",
+ "unrar_sys",
  "zip",
 ]
 

@@ -18,6 +18,7 @@ pub(super) struct ArchiveThumbnailSource {
 pub(super) struct ArchiveLoadRequest {
     pub(super) id: u64,
     pub(super) location: ArchiveLocation,
+    pub(super) cancel: crate::archive::ProgressiveArchiveCancelToken,
 }
 
 #[derive(Debug, Default)]
@@ -25,6 +26,7 @@ pub(super) struct ArchiveLibraryState {
     active: bool,
     next_request_id: u64,
     active_request_id: Option<u64>,
+    loading_cancel: Option<crate::archive::ProgressiveArchiveCancelToken>,
     location: Option<ArchiveLocation>,
     level: Option<ArchiveContentLevel>,
     error: Option<String>,
@@ -89,6 +91,11 @@ impl ArchiveLibraryState {
         backing: Option<Arc<super::archive_thumbnail_backing::ArchiveThumbnailBacking>>,
     ) -> ArchiveLoadRequest {
         self.cancel_progressive_thumbnails();
+        if let Some(cancel) = self.loading_cancel.take() {
+            cancel.cancel();
+        }
+        let cancel = crate::archive::ProgressiveArchiveCancelToken::default();
+        self.loading_cancel = Some(cancel.clone());
         self.active = true;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         self.active_request_id = Some(self.next_request_id);
@@ -100,6 +107,7 @@ impl ArchiveLibraryState {
         ArchiveLoadRequest {
             id: self.next_request_id,
             location,
+            cancel,
         }
     }
 
@@ -124,6 +132,7 @@ impl ArchiveLibraryState {
             return false;
         }
         self.active_request_id = None;
+        self.loading_cancel = None;
         match result {
             Ok(level) => {
                 self.location = Some(level.location.clone());
@@ -155,6 +164,9 @@ impl ArchiveLibraryState {
     pub(super) fn leave(&mut self) {
         self.cancel_progressive_thumbnails();
         self.active = false;
+        if let Some(cancel) = self.loading_cancel.take() {
+            cancel.cancel();
+        }
         self.active_request_id = None;
         self.location = None;
         self.level = None;
@@ -263,12 +275,28 @@ mod tests {
             ArchiveLocation::root(PathBuf::from("second.cbz")),
             root.path(),
         );
+        assert!(first.cancel.is_cancelled());
+        assert!(!second.cancel.is_cancelled());
         assert!(!state.apply(first.id, Err("stale".into())));
         assert!(state.apply(second.id, Err("current".into())));
         assert_eq!(
             state.status_message().as_deref(),
             Some("アーカイブの内容を表示できません\ncurrent")
         );
+    }
+
+    #[test]
+    fn leaving_cancels_the_pending_nested_materialization() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = ArchiveLibraryState::default();
+        let request = begin(
+            &mut state,
+            ArchiveLocation::root(PathBuf::from("outer.rar")),
+            root.path(),
+        );
+        state.leave();
+        assert!(request.cancel.is_cancelled());
+        assert!(!state.apply(request.id, Err("cancelled".into())));
     }
 
     #[test]

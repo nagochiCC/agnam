@@ -220,6 +220,7 @@ pub(crate) enum Msg {
     SetSliderAutoHide(bool),
     SetHeaderAutoHide(bool),
     SetThumbnailsEnabled(bool),
+    SetArchiveExpansionLimit(crate::archive::ArchiveExpansionLimit),
     SetThumbnailGenerationSpeed(ThumbnailGenerationSpeed),
     UpdateSliderVisibility {
         distance_from_bottom: f64,
@@ -462,6 +463,7 @@ impl Msg {
             | Self::SetSliderAutoHide(_)
             | Self::SetHeaderAutoHide(_)
             | Self::SetThumbnailsEnabled(_)
+            | Self::SetArchiveExpansionLimit(_)
             | Self::SetThumbnailGenerationSpeed(_)
             | Self::FullscreenChanged(_)
             | Self::SetPreviewPosition(_)

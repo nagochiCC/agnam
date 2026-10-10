@@ -100,7 +100,7 @@ impl ThumbnailWorker {
     {
         let mut worker = self;
         loop {
-            match worker.run_next(&mut emit) {
+            match worker.run_next(Default::default(), &mut emit) {
                 ThumbnailStep::More => {}
                 ThumbnailStep::Finished | ThumbnailStep::OutputClosed => return,
             }
@@ -110,7 +110,11 @@ impl ThumbnailWorker {
     /// Processes at most one page-schedule entry. Since a Spread's second page
     /// maps to an already generated Asset, the step may complete without decode.
     /// The background scheduler calls this at cooperative preemption boundaries.
-    pub(crate) fn run_next<F>(&mut self, emit: &mut F) -> ThumbnailStep
+    pub(crate) fn run_next<F>(
+        &mut self,
+        limit: crate::archive::ArchiveExpansionLimit,
+        emit: &mut F,
+    ) -> ThumbnailStep
     where
         F: FnMut(ThumbnailResult) -> bool,
     {
@@ -129,6 +133,7 @@ impl ThumbnailWorker {
         self.next_page += 1;
 
         let output_open = Self::generate_at(
+            limit,
             &self.assets,
             &self.pages,
             self.document_generation,
@@ -224,6 +229,7 @@ impl ThumbnailWorker {
     /// earlier in this worker generation and has since left the UI cache.
     pub(crate) fn run_demand<F>(
         &mut self,
+        limit: crate::archive::ArchiveExpansionLimit,
         asset_id: AssetId,
         bytes: Option<&gtk::glib::Bytes>,
         emit: &mut F,
@@ -259,7 +265,7 @@ impl ThumbnailWorker {
                         .map(|handle| (handle, self.document_generation, asset_id)),
                 )
             } else {
-                let bytes = state.loader.load_image_bytes(&asset.source)?;
+                let bytes = state.loader.load_image_bytes(limit, &asset.source)?;
                 make_asset_thumbnails_from_bytes_shared(
                     &mut state.decompressor,
                     &bytes,
@@ -302,6 +308,7 @@ impl ThumbnailWorker {
     }
 
     fn generate_at<F>(
+        limit: crate::archive::ArchiveExpansionLimit,
         assets: &[ImageAsset],
         pages: &[Page],
         document_generation: u64,
@@ -320,6 +327,7 @@ impl ThumbnailWorker {
             return true;
         };
         Self::generate_asset(
+            limit,
             assets,
             document_generation,
             generation,
@@ -333,6 +341,7 @@ impl ThumbnailWorker {
     }
 
     fn generate_asset<F>(
+        limit: crate::archive::ArchiveExpansionLimit,
         assets: &[ImageAsset],
         document_generation: u64,
         generation: u64,
@@ -353,7 +362,7 @@ impl ThumbnailWorker {
         let cached = entry.as_ref().and_then(|entry| disk_cache?.load(entry));
         let from_disk = cached.is_some();
         let Some(thumbnails) = cached.or_else(|| {
-            let bytes = state.loader.load_image_bytes(&asset.source)?;
+            let bytes = state.loader.load_image_bytes(limit, &asset.source)?;
             make_asset_thumbnails_from_bytes_shared(
                 &mut state.decompressor,
                 &bytes,
@@ -560,10 +569,13 @@ mod tests {
                         NearThumbnailStep::Generated
                     ),
                     1 => assert_eq!(
-                        worker.run_demand(AssetId(0), None, &mut emit),
+                        worker.run_demand(Default::default(), AssetId(0), None, &mut emit),
                         DemandThumbnailStep::Generated
                     ),
-                    _ => assert_eq!(worker.run_next(&mut emit), ThumbnailStep::Finished),
+                    _ => assert_eq!(
+                        worker.run_next(Default::default(), &mut emit),
+                        ThumbnailStep::Finished
+                    ),
                 }
                 assert_eq!(results.len(), 1);
                 assert_eq!(results[0].thumbnail.height, 200);
@@ -597,7 +609,7 @@ mod tests {
         );
         let mut results = Vec::new();
         assert_eq!(
-            worker.run_demand(AssetId(0), None, &mut |result| {
+            worker.run_demand(Default::default(), AssetId(0), None, &mut |result| {
                 results.push(result);
                 true
             }),
@@ -642,7 +654,7 @@ mod tests {
                     .unwrap();
                 writer.finish().unwrap();
             }
-            let (document, _) = load_document_from_path(&path).unwrap();
+            let (document, _) = load_document_from_path(Default::default(), &path).unwrap();
             let cache = ThumbnailDiskCache::new(temp.path().join("cache"), &path);
             let cancel = Arc::new(AtomicU64::new(7));
             let mut first = ThumbnailWorker::new_skipping(
@@ -656,7 +668,7 @@ mod tests {
             first.disk_cache = Some(cache.clone());
             let mut generated = Vec::new();
             assert_eq!(
-                first.run_demand(AssetId(0), None, &mut |result| {
+                first.run_demand(Default::default(), AssetId(0), None, &mut |result| {
                     generated.push(result.thumbnail);
                     true
                 }),
@@ -681,7 +693,7 @@ mod tests {
             let analyses = crate::viewer::ANALYSIS_COUNT.get();
             let mut results = Vec::new();
             assert_eq!(
-                worker.run_demand(AssetId(0), None, &mut |result| {
+                worker.run_demand(Default::default(), AssetId(0), None, &mut |result| {
                     results.push(result);
                     true
                 }),
@@ -700,7 +712,9 @@ mod tests {
             assert!(handle.take_ready(19, AssetId(0)).is_none());
             cancel.store(8, Ordering::Relaxed);
             assert_eq!(
-                worker.run_demand(AssetId(0), None, &mut |_| panic!("stale disk hit")),
+                worker.run_demand(Default::default(), AssetId(0), None, &mut |_| panic!(
+                    "stale disk hit"
+                )),
                 DemandThumbnailStep::Cancelled
             );
         }
@@ -718,7 +732,7 @@ mod tests {
         let source = pages.join("one.png");
         std::fs::write(&source, image.get_ref()).unwrap();
         std::fs::write(pages.join("two.png"), image.get_ref()).unwrap();
-        let (document, _) = load_document_from_path(&source).unwrap();
+        let (document, _) = load_document_from_path(Default::default(), &source).unwrap();
         assert_eq!(document.assets.len(), 2);
         let cache = ThumbnailDiskCache::new(temp.path().join("cache"), &source);
         let cancel = Arc::new(AtomicU64::new(7));
@@ -733,7 +747,7 @@ mod tests {
         first.disk_cache = Some(cache.clone());
         let mut generated = Vec::new();
         assert_eq!(
-            first.run_demand(AssetId(0), None, &mut |result| {
+            first.run_demand(Default::default(), AssetId(0), None, &mut |result| {
                 generated.push(result.thumbnail);
                 true
             }),
@@ -752,7 +766,7 @@ mod tests {
         reopened.disk_cache = Some(cache);
         let mut hit = Vec::new();
         assert_eq!(
-            reopened.run_demand(AssetId(0), None, &mut |result| {
+            reopened.run_demand(Default::default(), AssetId(0), None, &mut |result| {
                 hit.push(result.thumbnail);
                 true
             }),
@@ -766,7 +780,7 @@ mod tests {
         reopened.disk_cache = Some(ThumbnailDiskCache::new(blocked.join("cache"), &source));
         let mut available = false;
         assert_eq!(
-            reopened.run_demand(AssetId(0), None, &mut |_| {
+            reopened.run_demand(Default::default(), AssetId(0), None, &mut |_| {
                 available = true;
                 true
             }),
@@ -796,7 +810,7 @@ mod tests {
         let inner = zip(&[("page.png", image.get_ref())]);
         let outer = temp.path().join("outer.cbz");
         std::fs::write(&outer, zip(&[("inner.cbz", &inner)])).unwrap();
-        let (document, _) = load_document_from_path(&outer).unwrap();
+        let (document, _) = load_document_from_path(Default::default(), &outer).unwrap();
         assert_eq!(
             document.assets[0]
                 .archive_identity
@@ -822,7 +836,7 @@ mod tests {
         first.disk_cache = Some(cache.clone());
         let mut generated = Vec::new();
         assert_eq!(
-            first.run_demand(AssetId(0), None, &mut |result| {
+            first.run_demand(Default::default(), AssetId(0), None, &mut |result| {
                 generated.push(result.thumbnail);
                 true
             }),
@@ -831,7 +845,7 @@ mod tests {
         cache.flush_writes();
         drop(first);
         drop(document);
-        let (reopened, _) = load_document_from_path(&outer).unwrap();
+        let (reopened, _) = load_document_from_path(Default::default(), &outer).unwrap();
         assert_ne!(
             reopened.assets[0].source.as_file_path().unwrap(),
             first_temp
@@ -852,7 +866,7 @@ mod tests {
         second.disk_cache = Some(cache);
         let mut hit = Vec::new();
         assert_eq!(
-            second.run_demand(AssetId(0), None, &mut |result| {
+            second.run_demand(Default::default(), AssetId(0), None, &mut |result| {
                 hit.push(result.thumbnail);
                 true
             }),
@@ -930,7 +944,7 @@ mod tests {
                     writer.finish().unwrap();
                 }
             }
-            let (document, _) = load_document_from_path(&path).unwrap();
+            let (document, _) = load_document_from_path(Default::default(), &path).unwrap();
             assert!(matches!(
                 document.assets[0].source,
                 ImageSource::Memory(_) | ImageSource::File(_)
@@ -947,7 +961,7 @@ mod tests {
             first.disk_cache = Some(cache.clone());
             let mut generated = Vec::new();
             assert_eq!(
-                first.run_demand(AssetId(0), None, &mut |result| {
+                first.run_demand(Default::default(), AssetId(0), None, &mut |result| {
                     generated.push(result.thumbnail);
                     true
                 }),
@@ -955,7 +969,7 @@ mod tests {
             );
             assert_eq!(first.state.as_ref().unwrap().loader.source_load_count, 1);
             cache.flush_writes();
-            let (reopened, _) = load_document_from_path(&path).unwrap();
+            let (reopened, _) = load_document_from_path(Default::default(), &path).unwrap();
             let mut second = ThumbnailWorker::new_skipping(
                 reopened.assets,
                 reopened.pages,
@@ -967,7 +981,7 @@ mod tests {
             second.disk_cache = Some(cache);
             let mut hit = Vec::new();
             assert_eq!(
-                second.run_demand(AssetId(0), None, &mut |result| {
+                second.run_demand(Default::default(), AssetId(0), None, &mut |result| {
                     hit.push(result.thumbnail);
                     true
                 }),
@@ -1005,7 +1019,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("book.cbr");
         std::fs::write(&path, RAR).unwrap();
-        let (document, _) = load_document_from_path(&path).unwrap();
+        let (document, _) = load_document_from_path(Default::default(), &path).unwrap();
         assert_eq!(document.assets.len(), 1);
         let cache = ThumbnailDiskCache::new(temp.path().join("cache"), &path);
         let mut first = ThumbnailWorker::new_skipping(
@@ -1019,7 +1033,7 @@ mod tests {
         first.disk_cache = Some(cache.clone());
         let mut generated = Vec::new();
         assert_eq!(
-            first.run_demand(AssetId(0), None, &mut |result| {
+            first.run_demand(Default::default(), AssetId(0), None, &mut |result| {
                 generated.push(result.thumbnail);
                 true
             }),
@@ -1027,7 +1041,7 @@ mod tests {
         );
         assert_eq!(first.state.as_ref().unwrap().loader.source_load_count, 1);
         cache.flush_writes();
-        let (reopened, _) = load_document_from_path(&path).unwrap();
+        let (reopened, _) = load_document_from_path(Default::default(), &path).unwrap();
         let mut second = ThumbnailWorker::new_skipping(
             reopened.assets,
             reopened.pages,
@@ -1039,7 +1053,7 @@ mod tests {
         second.disk_cache = Some(cache);
         let mut hit = Vec::new();
         assert_eq!(
-            second.run_demand(AssetId(0), None, &mut |result| {
+            second.run_demand(Default::default(), AssetId(0), None, &mut |result| {
                 hit.push(result.thumbnail);
                 true
             }),
@@ -1063,7 +1077,9 @@ mod tests {
             }),
             NearThumbnailStep::Generated
         );
-        while worker.run_next(&mut |_| panic!("distributed duplicate")) == ThumbnailStep::More {}
+        while worker.run_next(Default::default(), &mut |_| panic!("distributed duplicate"))
+            == ThumbnailStep::More
+        {}
 
         assert_eq!(results, vec![0, 1]);
         assert!(
@@ -1092,7 +1108,7 @@ mod tests {
         );
 
         let mut results = Vec::new();
-        while worker.run_next(&mut |result| {
+        while worker.run_next(Default::default(), &mut |result| {
             results.push(result.index);
             true
         }) == ThumbnailStep::More
@@ -1168,10 +1184,15 @@ mod tests {
         let mut results = Vec::new();
 
         assert_eq!(
-            worker.run_demand(AssetId(0), Some(&bytes), &mut |result| {
-                results.push(result.index);
-                true
-            }),
+            worker.run_demand(
+                Default::default(),
+                AssetId(0),
+                Some(&bytes),
+                &mut |result| {
+                    results.push(result.index);
+                    true
+                }
+            ),
             DemandThumbnailStep::Generated
         );
         assert_eq!(results, vec![0, 1]);

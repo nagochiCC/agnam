@@ -40,12 +40,15 @@ pub(crate) fn load_cached_direct(source: &Path) -> Option<ThumbnailData> {
 
 #[cfg(test)]
 pub(crate) fn generate_and_cache(
+    limit: crate::archive::ArchiveExpansionLimit,
     source: impl Into<CoverSource>,
 ) -> Result<ThumbnailData, BookshelfThumbnailError> {
-    Ok(generate_and_cache_with_cancel(source, &|| false)?.expect("uncancelled Cover generation"))
+    Ok(generate_and_cache_with_cancel(limit, source, &|| false)?
+        .expect("uncancelled Cover generation"))
 }
 
 pub(crate) fn generate_and_cache_with_cancel(
+    limit: crate::archive::ArchiveExpansionLimit,
     source: impl Into<CoverSource>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Option<ThumbnailData>, BookshelfThumbnailError> {
@@ -56,28 +59,31 @@ pub(crate) fn generate_and_cache_with_cancel(
     let mut store = CoverStore::load();
     let resolved = resolve_source(source, &mut store);
     let cache = BookshelfThumbnailCache::for_user();
-    generate_with_store_cancel(&cache, &mut store, resolved, cancelled)
+    generate_with_store_cancel(limit, &cache, &mut store, resolved, cancelled)
 }
 
 pub(crate) fn generate_and_cache_direct(
     source: &Path,
 ) -> Result<ThumbnailData, BookshelfThumbnailError> {
-    BookshelfThumbnailCache::for_user().generate_and_cache(CoverSource::File(source.to_path_buf()))
+    BookshelfThumbnailCache::for_user()
+        .generate_and_cache(Default::default(), CoverSource::File(source.to_path_buf()))
 }
 
 #[cfg(test)]
 fn generate_with_store(
+    limit: crate::archive::ArchiveExpansionLimit,
     cache: &BookshelfThumbnailCache,
     store: &mut CoverStore,
     resolved: CoverSource,
 ) -> Result<ThumbnailData, BookshelfThumbnailError> {
     Ok(
-        generate_with_store_cancel(cache, store, resolved, &|| false)?
+        generate_with_store_cancel(limit, cache, store, resolved, &|| false)?
             .expect("uncancelled Cover generation"),
     )
 }
 
 fn generate_with_store_cancel(
+    limit: crate::archive::ArchiveExpansionLimit,
     cache: &BookshelfThumbnailCache,
     store: &mut CoverStore,
     resolved: CoverSource,
@@ -86,7 +92,7 @@ fn generate_with_store_cancel(
     if cancelled() {
         return Ok(None);
     }
-    let result = cache.generate_and_cache_with_cancel(resolved.clone(), cancelled);
+    let result = cache.generate_and_cache_with_cancel(limit, resolved.clone(), cancelled);
     if cancelled() {
         return Ok(None);
     }
@@ -102,7 +108,7 @@ fn generate_with_store_cancel(
                         identity.clone(),
                     ))
                 })?;
-            cache.generate_and_cache_with_cancel(replacement, cancelled)
+            cache.generate_and_cache_with_cancel(limit, replacement, cancelled)
         }
         Err(BookshelfThumbnailError::Generation(_)) if resolved.external_identity().is_some() => {
             if cancelled() {
@@ -116,7 +122,7 @@ fn generate_with_store_cancel(
                         identity.clone(),
                     ))
                 })?;
-            cache.generate_and_cache_with_cancel(replacement, cancelled)
+            cache.generate_and_cache_with_cancel(limit, replacement, cancelled)
         }
         result => result,
     }
@@ -165,15 +171,17 @@ impl BookshelfThumbnailCache {
     /// write failures never hide successfully generated data from the caller.
     pub(crate) fn generate_and_cache(
         &self,
+        limit: crate::archive::ArchiveExpansionLimit,
         source: impl Into<CoverSource>,
     ) -> Result<ThumbnailData, BookshelfThumbnailError> {
         Ok(self
-            .generate_and_cache_with_cancel(source, &|| false)?
+            .generate_and_cache_with_cancel(limit, source, &|| false)?
             .expect("uncancelled Cover generation"))
     }
 
     pub(crate) fn generate_and_cache_with_cancel(
         &self,
+        limit: crate::archive::ArchiveExpansionLimit,
         source: impl Into<CoverSource>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Option<ThumbnailData>, BookshelfThumbnailError> {
@@ -187,7 +195,11 @@ impl BookshelfThumbnailCache {
         if cancelled() {
             return Ok(None);
         }
-        let source_bytes = source.load_bytes()?;
+        let source_bytes = match source.load_bytes_with_cancel(limit, cancelled) {
+            Ok(bytes) => bytes,
+            Err(_) if cancelled() => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         if cancelled() {
             return Ok(None);
         }
@@ -375,12 +387,16 @@ mod tests {
         };
         assert!(
             cache
-                .generate_and_cache_with_cancel(&source, &cancelled)
+                .generate_and_cache_with_cancel(Default::default(), &source, &cancelled)
                 .unwrap()
                 .is_none()
         );
         assert!(cache.load_cached(&source).is_none());
-        assert!(cache.generate_and_cache(&source).is_ok());
+        assert!(
+            cache
+                .generate_and_cache(Default::default(), &source)
+                .is_ok()
+        );
         assert!(cache.load_cached(&source).is_some());
     }
 
@@ -389,7 +405,9 @@ mod tests {
         let (_directory, source, cache) = cache_fixture();
 
         assert!(cache.load_cached(&source).is_none());
-        let generated = cache.generate_and_cache(&source).unwrap();
+        let generated = cache
+            .generate_and_cache(Default::default(), &source)
+            .unwrap();
         let cached = cache.load_cached(&source).unwrap();
 
         assert_eq!(generated, cached);
@@ -399,11 +417,15 @@ mod tests {
     #[test]
     fn source_change_invalidates_cache() {
         let (_directory, source, cache) = cache_fixture();
-        cache.generate_and_cache(&source).unwrap();
+        cache
+            .generate_and_cache(Default::default(), &source)
+            .unwrap();
 
         write_source(&source, 121, 181, [200, 30, 40]);
         assert!(cache.load_cached(&source).is_none());
-        let changed = cache.generate_and_cache(&source).unwrap();
+        let changed = cache
+            .generate_and_cache(Default::default(), &source)
+            .unwrap();
 
         assert_eq!(changed.pixels[0], 200);
     }
@@ -411,7 +433,9 @@ mod tests {
     #[test]
     fn version_mismatch_and_corrupt_png_are_cache_misses() {
         let (_directory, source, cache) = cache_fixture();
-        cache.generate_and_cache(&source).unwrap();
+        cache
+            .generate_and_cache(Default::default(), &source)
+            .unwrap();
         let paths = CachePaths::new(&cache.directory, &CoverSource::from(&source));
 
         let metadata = std::fs::read_to_string(&paths.metadata).unwrap();
@@ -421,19 +445,25 @@ mod tests {
         )
         .unwrap();
         assert!(cache.load_cached(&source).is_none());
-        cache.generate_and_cache(&source).unwrap();
+        cache
+            .generate_and_cache(Default::default(), &source)
+            .unwrap();
         assert!(cache.load_cached(&source).is_some());
 
         std::fs::write(&paths.cover, b"broken PNG").unwrap();
         assert!(cache.load_cached(&source).is_none());
-        cache.generate_and_cache(&source).unwrap();
+        cache
+            .generate_and_cache(Default::default(), &source)
+            .unwrap();
         assert!(cache.load_cached(&source).is_some());
     }
 
     #[test]
     fn incomplete_cache_artifacts_are_misses() {
         let (_directory, source, cache) = cache_fixture();
-        cache.generate_and_cache(&source).unwrap();
+        cache
+            .generate_and_cache(Default::default(), &source)
+            .unwrap();
         let paths = CachePaths::new(&cache.directory, &CoverSource::from(&source));
         let metadata = std::fs::read(&paths.metadata).unwrap();
         std::fs::remove_file(&paths.metadata).unwrap();
@@ -448,7 +478,9 @@ mod tests {
     #[test]
     fn cover_only_cache_uses_one_png() {
         let (_directory, source, cache) = cache_fixture();
-        let generated = cache.generate_and_cache(&source).unwrap();
+        let generated = cache
+            .generate_and_cache(Default::default(), &source)
+            .unwrap();
         let paths = CachePaths::new(&cache.directory, &CoverSource::from(&source));
 
         assert!(paths.cover.is_file());
@@ -477,7 +509,9 @@ mod tests {
         std::fs::write(&not_a_directory, b"file").unwrap();
         let cache = BookshelfThumbnailCache::new(not_a_directory.join("auto"));
 
-        let result = cache.generate_and_cache(&source).unwrap();
+        let result = cache
+            .generate_and_cache(Default::default(), &source)
+            .unwrap();
 
         assert_eq!((result.width, result.height), (100, 150));
     }
@@ -510,6 +544,7 @@ mod tests {
         let cache = BookshelfThumbnailCache::new(directory.path().join("cache"));
 
         let thumbnail = generate_with_store(
+            Default::default(),
             &cache,
             &mut store,
             CoverSource::ArchiveOverride {
@@ -559,7 +594,8 @@ mod tests {
         std::fs::write(&copied, b"corrupt").unwrap();
         let cache = BookshelfThumbnailCache::new(directory.path().join("cache"));
 
-        let thumbnail = generate_with_store(&cache, &mut store, resolved).unwrap();
+        let thumbnail =
+            generate_with_store(Default::default(), &cache, &mut store, resolved).unwrap();
 
         assert_eq!(thumbnail.pixels[0], 6);
         assert!(!copied.exists());
@@ -604,6 +640,10 @@ mod tests {
         let cache = BookshelfThumbnailCache::new(directory.path().join("cache"));
 
         assert!(cache.load_cached(&source).is_none());
-        assert!(cache.generate_and_cache(&source).is_err());
+        assert!(
+            cache
+                .generate_and_cache(Default::default(), &source)
+                .is_err()
+        );
     }
 }

@@ -35,8 +35,9 @@
 ## archive内容表示
 
 - archive Bookの「アーカイブの内容を表示」は、archiveを汎用file managerとして展開せず、Agnamで意味のある内容だけをLibrary形式で階層表示する。対応画像、対応画像または対応nested archiveへ到達するためのfolder、対応nested archiveを表示し、その他の非対応fileやmacOS metadata等は表示しない。
-- archive内部の実階層を維持し、rootを開いただけでnested archive内部を再帰的に全走査しない。nested archiveはユーザーがそのcontainerへ入った時点で読み込み、再帰上限と安全な一時展開規則を維持する。一時pathは永続identityに使用しない。
+- archive内部の実階層を維持し、rootを開いただけでnested archive内部を再帰的に全走査しない。nested archiveはユーザーがそのcontainerへ入った時点で、内部archive全体をVecにせず一時fileへbounded materializeする。画像・通常fileは64 MiB、disk materializeするarchive entryはoperation開始時の最大展開データ量を上限とし、outerからdescendantまで同じ展開 / disk budgetを共有する。再帰上限と安全なpath規則を維持し、一時pathは永続identityに使用しない。ZIP / non-solid 7zは対象entryをstreamし、RAR / solid 7z / TAR / LHAは既存の逐次materializeを維持する。共有readerがworkspaceを所有し、navigation後も実行中のthumbnail jobが使用中のfileを先に削除しない。
 - breadcrumbは通常Libraryと同じ操作感で `home > archive > folder > nested archive ...` を表現し、祖先segmentからarchive内部の任意の既表示階層へ戻れる。先頭home iconは「本棚トップ」を表し、archiveのrootにいる場合はLibrary本棚へ戻る。
+- archive階層loadは新しいnavigationやLibrary終了時に旧requestへcancelを伝搬し、stale結果を採用しない。Cover overrideもarchive chainをpathで渡し、最終画像のみ64 MiB以内で取得する。cancel / 失敗では不完全なworkspaceを再利用しない。
 - 各階層の表示順は通常本棚の並び替え設定とは独立したnatural ascendingとする。Sequential / solid archiveでも実際の展開順にcardを追加・再配置せず、entry metadataから最終位置を先に確定してplaceholderを置き、取得できたthumbnailを対応する固定位置へ反映する。
 - Random Access archiveのthumbnailはvisible demandを優先し、一覧表示のために全画像を展開しない。progressive対応Sequential archiveは一度の順次走査でthumbnailを生成し、Viewer用Documentや全画像byteを完成まで保持しない。高並列decodeは行わず、UI応答性とPC負荷の抑制を優先する。
 - archive内容表示を離れた後のbackground listing / thumbnail結果はsession / request世代を検証して破棄し、現在のLibraryへstale結果を反映しない。
@@ -115,7 +116,7 @@
 - 通常filesystem本棚のdecoded `GdkTexture` はsource path + `ThumbnailSourceKind`をidentityとする全ancestor chain共通LRUで再利用し、backing pixel memoryのsoft budgetを64MiBとする。現在visibleなTextureはpinしてevictせず、visibleだけでbudgetを超える場合のみ一時超過を許容する。画面外の古いTextureや離れたchild branch専用Textureはevictし、現在Widgetがpaintable参照を持つ場合も外して実体を解放可能にする。archive内容表示用Textureは通常本棚とは独立した64MiB LRUとし、一度生成した最大468×312px thumbnailをXDG user cache配下のsession backingへlossless保存する。eviction後はこのbackingから復元し、Sequential archiveをTexture再表示のために再展開しない。backingを利用できないsessionでは再展開回避を優先してLRU evictionを停止する。
 - visible demandに基づきoffscreen sourceを無条件にqueueへ積まない。scroll・resizeで需要を再評価する。
 - cache lookup/loadは最大8件、cache miss後の生成は最大2件を基本とする。source path + `ThumbnailSourceKind`単位で重複実行を抑え、generationでstale結果を排除する。
-- 本棚・検索・履歴・お気に入りのCover生成は各scopeのgeneration更新時に旧jobへcancelを通知する。source読込・codec decode・crop/resizeの実行中は中断せず、前後の安全な境界で終了する。旧jobは終了Msgまで物理worker slotを占め、cancel結果は失敗表示にしない。cache書込み開始後は途中cancelせず、cover PNGの後にmetadataをatomic writeする。
+- 本棚・検索・履歴・お気に入りのCover生成は各scopeのgeneration更新時に旧jobへcancelを通知する。archive sourceのbounded materialize / 読込は安全なchunk / entry境界でもcancelを確認する。codec decode・crop/resizeの実行中は中断せず、前後の安全な境界で終了する。旧jobは終了Msgまで物理worker slotを占め、cancel結果は失敗表示にしない。cache書込み開始後は途中cancelせず、cover PNGの後にmetadataをatomic writeする。
 - cache hitは描画frame単位でまとめて反映し、生成成功は80ms quietまたは最初の到着から240ms maximum latencyでbatch反映する。
 - cacheなしの新directory初回表示ではscrollerをopacity 0のままWidget treeへ配置し、最初のvisible demandのcache lookup一巡または100msの早い方でcache hitを反映して即時revealする。cache miss後の生成完了は待たない。cached directory再訪ではscrollerを隠さず保持済みscan結果とTextureを即表示し、不足しているvisible Textureだけをdisk cache / generationから補う。
 - JPEG thumbnailはTurboJPEGの縮小decodeを利用する。3:2 crop対象では概念上のcrop後寸法を基準に縮小率を選び、最終crop / resize後も不要なupscaleを行わない。PNG / WebPはJPEGより生成costが高く、大画像を多数含むarchive内容表示では全thumbnailが揃うまで時間がかかる場合があるが、PC負荷を抑えるため積極的な並列decodeは行わない。

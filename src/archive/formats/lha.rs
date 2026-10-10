@@ -138,7 +138,7 @@ pub(super) fn extract_to_dir(
             if let Some(parent) = output_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            budget.copy_to_path(&mut lha, &output_path, Some(original_size))?;
+            budget.copy_materialized_to_path(&mut lha, &output_path, Some(original_size))?;
         }
 
         if !lha.seek_next_file().map_err(archive_error)? {
@@ -149,8 +149,12 @@ pub(super) fn extract_to_dir(
     Ok(())
 }
 
-pub(super) fn load_document(archive_path: &Path) -> Result<Document, AppError> {
+pub(super) fn load_document(
+    limit: crate::archive::ArchiveExpansionLimit,
+    archive_path: &Path,
+) -> Result<Document, AppError> {
     load_document_with_limit(
+        limit,
         archive_path,
         super::SEQUENTIAL_ARCHIVE_MEMORY_LIMIT_BYTES,
         super::sequential_spill_root(),
@@ -158,13 +162,14 @@ pub(super) fn load_document(archive_path: &Path) -> Result<Document, AppError> {
 }
 
 fn load_document_with_limit(
+    limit: crate::archive::ArchiveExpansionLimit,
     archive_path: &Path,
     memory_limit: usize,
     spill_root: std::path::PathBuf,
 ) -> Result<Document, AppError> {
     let mut lha = delharc::parse_file(archive_path).map_err(archive_error)?;
     let mut images = SequentialImageStorage::with_limit_in(0, memory_limit, spill_root);
-    let mut budget = crate::archive::resource::ResourceBudget::default();
+    let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
     let mut index = 0;
 
     loop {
@@ -362,8 +367,13 @@ mod tests {
             .unwrap();
 
         let spill_root = directory.path().join("cache/agnam/tmp");
-        let document =
-            load_document_with_limit(&archive_path, first.len(), spill_root.clone()).unwrap();
+        let document = load_document_with_limit(
+            Default::default(),
+            &archive_path,
+            first.len(),
+            spill_root.clone(),
+        )
+        .unwrap();
         assert!(document.temp_dir.is_some());
         assert!(
             document

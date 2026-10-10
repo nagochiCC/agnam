@@ -232,6 +232,19 @@ impl App {
         self.settings.save();
     }
 
+    pub(super) fn set_archive_expansion_limit(
+        &mut self,
+        limit: crate::archive::ArchiveExpansionLimit,
+    ) {
+        if self.settings.archive_expansion_limit == limit {
+            return;
+        }
+        self.settings.archive_expansion_limit = limit;
+        self.viewer.background.set_archive_expansion_limit(limit);
+        self.shell.settings_dialog.sync(&self.settings);
+        self.settings.save();
+    }
+
     pub(super) fn set_thumbnail_generation_speed(&mut self, speed: ThumbnailGenerationSpeed) {
         if self.settings.thumbnail_generation_speed == speed {
             return;

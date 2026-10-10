@@ -359,11 +359,12 @@ impl ViewerSession {
         &mut self,
         smart_crop: bool,
     ) -> (Option<gtk::gdk::Paintable>, Option<gtk::gdk::Paintable>) {
-        self.current_textures_with_preparation(smart_crop, None)
+        self.current_textures_with_preparation(Default::default(), smart_crop, None)
     }
 
     pub(crate) fn current_textures_with_preparation(
         &mut self,
+        limit: crate::archive::ArchiveExpansionLimit,
         smart_crop: bool,
         preparation: Option<&SmartCropPreparationHandle>,
     ) -> (Option<gtk::gdk::Paintable>, Option<gtk::gdk::Paintable>) {
@@ -373,10 +374,15 @@ impl ViewerSession {
 
         let current_index = self.state.current_index();
         let is_full_spread = self.state.is_full_spread(&document.pages);
-        let right =
-            self.ensure_texture_for_page_with_preparation(current_index, smart_crop, preparation);
+        let right = self.ensure_texture_for_page_with_preparation(
+            limit,
+            current_index,
+            smart_crop,
+            preparation,
+        );
         let left = if is_full_spread {
             self.ensure_texture_for_page_with_preparation(
+                limit,
                 current_index + 1,
                 smart_crop,
                 preparation,
@@ -404,11 +410,17 @@ impl ViewerSession {
         page_index: usize,
         smart_crop: bool,
     ) -> Option<gtk::gdk::Paintable> {
-        self.ensure_texture_for_page_with_preparation(page_index, smart_crop, None)
+        self.ensure_texture_for_page_with_preparation(
+            Default::default(),
+            page_index,
+            smart_crop,
+            None,
+        )
     }
 
     fn ensure_texture_for_page_with_preparation(
         &mut self,
+        limit: crate::archive::ArchiveExpansionLimit,
         page_index: usize,
         smart_crop: bool,
         preparation: Option<&SmartCropPreparationHandle>,
@@ -436,7 +448,7 @@ impl ViewerSession {
         let bytes = if let Some(bytes) = self.cache.get_bytes(page.asset_id) {
             bytes
         } else {
-            let bytes = match try_load_image_bytes(&asset.source) {
+            let bytes = match try_load_image_bytes(limit, &asset.source) {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => gtk::glib::Bytes::from_static(&[]),
                 Err(crate::error::AppError::ArchiveResourceLimit(kind)) => {
@@ -581,6 +593,7 @@ impl ViewerSession {
 
     pub(crate) fn decode_preloaded(
         &mut self,
+        limit: crate::archive::ArchiveExpansionLimit,
         document_generation: u64,
         asset_id: AssetId,
         page_index: usize,
@@ -596,7 +609,7 @@ impl ViewerSession {
             return;
         };
         if self
-            .ensure_texture_for_page_with_preparation(texture_index, smart_crop, preparation)
+            .ensure_texture_for_page_with_preparation(limit, texture_index, smart_crop, preparation)
             .is_some()
         {
             let Some(document) = self.document.as_ref() else {
@@ -906,7 +919,7 @@ mod tests {
         let generation = session.document_generation();
 
         assert!(session.cached_bytes(asset_id).is_none());
-        session.decode_preloaded(generation, asset_id, 1, false, None);
+        session.decode_preloaded(Default::default(), generation, asset_id, 1, false, None);
 
         assert!(session.cached_bytes(asset_id).is_some());
         assert!(session.has_texture(1));
@@ -940,7 +953,7 @@ mod tests {
         let prepared = analyze_smart_crop_asset(second.as_ref(), ImageLayout::Single).unwrap();
         assert!(session.accept_crop_analysis(generation, asset_id, 1, prepared));
         assert!(!session.has_texture(1));
-        session.decode_preloaded(generation, asset_id, 1, true, None);
+        session.decode_preloaded(Default::default(), generation, asset_id, 1, true, None);
         assert!(session.has_texture(1));
         assert!(session.cached_crop_result(asset_id).is_some());
     }
@@ -992,7 +1005,7 @@ mod tests {
         assert!(session.next_page());
         let handle = scheduler.handle();
         let texture = session
-            .current_textures_with_preparation(true, Some(&handle))
+            .current_textures_with_preparation(Default::default(), true, Some(&handle))
             .0
             .unwrap();
         assert_eq!(texture.intrinsic_width(), 80);
@@ -1035,7 +1048,7 @@ mod tests {
                     let handle = scheduler.handle();
 
                     let off = session
-                        .current_textures_with_preparation(false, Some(&handle))
+                        .current_textures_with_preparation(Default::default(), false, Some(&handle))
                         .0
                         .unwrap();
                     assert_eq!(off.intrinsic_height(), 70);
@@ -1046,7 +1059,7 @@ mod tests {
                     );
                     session.clear_textures();
                     let on = session
-                        .current_textures_with_preparation(true, Some(&handle))
+                        .current_textures_with_preparation(Default::default(), true, Some(&handle))
                         .0
                         .unwrap();
                     let cached = session.cached_crop_result(asset).unwrap();
@@ -1072,7 +1085,11 @@ mod tests {
                         session.clear_textures();
                         assert_eq!(session.cached_crop_result(asset), Some(cached));
                         let rendered = session
-                            .current_textures_with_preparation(enabled, Some(&handle))
+                            .current_textures_with_preparation(
+                                Default::default(),
+                                enabled,
+                                Some(&handle),
+                            )
                             .0
                             .unwrap();
                         assert_eq!(
@@ -1130,7 +1147,14 @@ mod tests {
             CPU_DECODE_COUNT.get(),
             handle.decode_count(),
         );
-        session.decode_preloaded(generation, asset_id, 1, true, Some(&handle));
+        session.decode_preloaded(
+            Default::default(),
+            generation,
+            asset_id,
+            1,
+            true,
+            Some(&handle),
+        );
         assert!(session.has_texture(1));
         assert_eq!(session.cached_crop_result(asset_id), Some(None));
         assert!(handle.take_ready(generation, asset_id).is_none());

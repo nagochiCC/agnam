@@ -49,7 +49,11 @@ impl App {
         match msg {
             Msg::HistoryCoverDemandChanged => {
                 let jobs = self.navigation.history_view.demand_changed();
-                Self::spawn_history_cover_jobs(jobs, &sender);
+                Self::spawn_history_cover_jobs(
+                    self.settings.archive_expansion_limit,
+                    jobs,
+                    &sender,
+                );
             }
             Msg::HistoryCoverCacheLoadFinished {
                 generation,
@@ -60,7 +64,11 @@ impl App {
                     .navigation
                     .history_view
                     .cache_finished(generation, source, thumbnail);
-                Self::spawn_history_cover_jobs(jobs, &sender);
+                Self::spawn_history_cover_jobs(
+                    self.settings.archive_expansion_limit,
+                    jobs,
+                    &sender,
+                );
             }
             Msg::HistoryCoverGenerationFinished {
                 generation,
@@ -71,7 +79,11 @@ impl App {
                     .navigation
                     .history_view
                     .generation_finished(generation, source, result);
-                Self::spawn_history_cover_jobs(jobs, &sender);
+                Self::spawn_history_cover_jobs(
+                    self.settings.archive_expansion_limit,
+                    jobs,
+                    &sender,
+                );
             }
             Msg::ResumeHistory {
                 identity,
@@ -99,7 +111,11 @@ impl App {
         match msg {
             Msg::FavoritesCoverDemandChanged => {
                 let jobs = self.navigation.favorites_view.demand_changed();
-                Self::spawn_favorites_cover_jobs(jobs, &sender);
+                Self::spawn_favorites_cover_jobs(
+                    self.settings.archive_expansion_limit,
+                    jobs,
+                    &sender,
+                );
             }
             Msg::FavoritesCoverCacheLoadFinished {
                 generation,
@@ -111,7 +127,11 @@ impl App {
                     .navigation
                     .favorites_view
                     .cache_finished(generation, identity, source, thumbnail);
-                Self::spawn_favorites_cover_jobs(jobs, &sender);
+                Self::spawn_favorites_cover_jobs(
+                    self.settings.archive_expansion_limit,
+                    jobs,
+                    &sender,
+                );
             }
             Msg::FavoritesCoverGenerationFinished {
                 generation,
@@ -123,7 +143,11 @@ impl App {
                     .navigation
                     .favorites_view
                     .generation_finished(generation, identity, source, result);
-                Self::spawn_favorites_cover_jobs(jobs, &sender);
+                Self::spawn_favorites_cover_jobs(
+                    self.settings.archive_expansion_limit,
+                    jobs,
+                    &sender,
+                );
             }
             Msg::OpenFavorite(path) => self.open_favorite(path, &sender),
             Msg::FavoriteOpenResolved {
@@ -561,6 +585,7 @@ impl App {
             Msg::SetSliderAutoHide(auto_hide) => self.set_slider_auto_hide(auto_hide),
             Msg::SetHeaderAutoHide(auto_hide) => self.set_header_auto_hide(auto_hide),
             Msg::SetThumbnailsEnabled(enabled) => self.set_thumbnails_enabled(enabled, &sender),
+            Msg::SetArchiveExpansionLimit(limit) => self.set_archive_expansion_limit(limit),
             Msg::SetThumbnailGenerationSpeed(speed) => self.set_thumbnail_generation_speed(speed),
             Msg::FullscreenChanged(fullscreen) => self.fullscreen_changed(fullscreen),
             Msg::SetPreviewPosition(mode) => self.set_preview_position_mode(mode),

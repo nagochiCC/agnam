@@ -356,7 +356,7 @@ fn archive_contents_keep_natural_listing_and_reject_a_previous_session() {
     zip.finish().unwrap();
 
     let location = ArchiveLocation::root(archive.clone());
-    let level = ArchiveContentLevel::open(location.clone()).unwrap();
+    let level = ArchiveContentLevel::open(Default::default(), location.clone()).unwrap();
     assert_eq!(
         level
             .items
@@ -365,7 +365,7 @@ fn archive_contents_keep_natural_listing_and_reject_a_previous_session() {
             .collect::<Vec<_>>(),
         [Path::new("pages")]
     );
-    let mut nested_level = ArchiveContentLevel::open(location.clone()).unwrap();
+    let mut nested_level = ArchiveContentLevel::open(Default::default(), location.clone()).unwrap();
     assert!(nested_level.navigate_directory(PathBuf::from("pages")));
     assert_eq!(
         nested_level

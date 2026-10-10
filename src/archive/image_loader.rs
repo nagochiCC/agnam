@@ -4,11 +4,17 @@ use crate::error::AppError;
 use gtk::glib;
 use std::path::PathBuf;
 
-pub(crate) fn load_image_bytes(source: &ImageSource) -> Option<glib::Bytes> {
-    try_load_image_bytes(source).ok().flatten()
+pub(crate) fn load_image_bytes(
+    limit: crate::archive::ArchiveExpansionLimit,
+    source: &ImageSource,
+) -> Option<glib::Bytes> {
+    try_load_image_bytes(limit, source).ok().flatten()
 }
 
-pub(crate) fn try_load_image_bytes(source: &ImageSource) -> Result<Option<glib::Bytes>, AppError> {
+pub(crate) fn try_load_image_bytes(
+    limit: crate::archive::ArchiveExpansionLimit,
+    source: &ImageSource,
+) -> Result<Option<glib::Bytes>, AppError> {
     match source {
         ImageSource::File(path) => {
             let file = std::fs::File::open(path)?;
@@ -24,7 +30,7 @@ pub(crate) fn try_load_image_bytes(source: &ImageSource) -> Result<Option<glib::
             let Some(mut archive) = RandomAccessArchiveReader::open(archive_path) else {
                 return Ok(None);
             };
-            archive.read_entry(*entry_index, entry_name)
+            archive.read_entry(limit, *entry_index, entry_name)
         }
         ImageSource::Memory(data) => Ok(Some(data.clone())),
     }
@@ -49,7 +55,11 @@ impl ThumbnailImageLoader {
         }
     }
 
-    pub(crate) fn load_image_bytes(&mut self, source: &ImageSource) -> Option<glib::Bytes> {
+    pub(crate) fn load_image_bytes(
+        &mut self,
+        limit: crate::archive::ArchiveExpansionLimit,
+        source: &ImageSource,
+    ) -> Option<glib::Bytes> {
         #[cfg(test)]
         {
             self.source_load_count += 1;
@@ -60,7 +70,7 @@ impl ThumbnailImageLoader {
             entry_name,
         } = source
         else {
-            return load_image_bytes(source);
+            return load_image_bytes(limit, source);
         };
 
         let needs_open = self
@@ -79,7 +89,10 @@ impl ThumbnailImageLoader {
         let Some((_, archive)) = self.archive.as_mut() else {
             return None;
         };
-        archive.read_entry(*entry_index, entry_name).ok().flatten()
+        archive
+            .read_entry(limit, *entry_index, entry_name)
+            .ok()
+            .flatten()
     }
 }
 
@@ -135,9 +148,22 @@ mod tests {
             entry_name: "page.jpg".into(),
         };
 
-        assert_eq!(load_image_bytes(&file).unwrap().as_ref(), b"file");
-        assert_eq!(load_image_bytes(&memory).unwrap().as_ref(), b"memory");
-        assert_eq!(load_image_bytes(&zip).unwrap().as_ref(), b"zip");
+        assert_eq!(
+            load_image_bytes(Default::default(), &file)
+                .unwrap()
+                .as_ref(),
+            b"file"
+        );
+        assert_eq!(
+            load_image_bytes(Default::default(), &memory)
+                .unwrap()
+                .as_ref(),
+            b"memory"
+        );
+        assert_eq!(
+            load_image_bytes(Default::default(), &zip).unwrap().as_ref(),
+            b"zip"
+        );
     }
 
     #[test]
@@ -161,9 +187,18 @@ mod tests {
         };
         let mut loader = ThumbnailImageLoader::new();
 
-        assert_eq!(loader.load_image_bytes(&first).unwrap().as_ref(), b"first");
         assert_eq!(
-            loader.load_image_bytes(&second).unwrap().as_ref(),
+            loader
+                .load_image_bytes(Default::default(), &first)
+                .unwrap()
+                .as_ref(),
+            b"first"
+        );
+        assert_eq!(
+            loader
+                .load_image_bytes(Default::default(), &second)
+                .unwrap()
+                .as_ref(),
             b"second"
         );
         assert_eq!(loader.archive_open_count, 1);
@@ -189,9 +224,18 @@ mod tests {
         };
         let mut loader = ThumbnailImageLoader::new();
 
-        assert_eq!(loader.load_image_bytes(&first).unwrap().as_ref(), b"first");
         assert_eq!(
-            loader.load_image_bytes(&second).unwrap().as_ref(),
+            loader
+                .load_image_bytes(Default::default(), &first)
+                .unwrap()
+                .as_ref(),
+            b"first"
+        );
+        assert_eq!(
+            loader
+                .load_image_bytes(Default::default(), &second)
+                .unwrap()
+                .as_ref(),
             b"second"
         );
         assert_eq!(loader.archive_open_count, 1);

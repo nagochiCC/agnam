@@ -105,7 +105,7 @@ fn make_asset_thumbnails_with_loader(
     decompressor: &mut turbojpeg::Decompressor,
     asset: &ImageAsset,
 ) -> Option<AssetThumbnails> {
-    let bytes = loader.load_image_bytes(&asset.source)?;
+    let bytes = loader.load_image_bytes(Default::default(), &asset.source)?;
     make_asset_thumbnails_from_bytes(decompressor, &bytes, asset.layout)
 }
 

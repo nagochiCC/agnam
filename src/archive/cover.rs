@@ -45,7 +45,22 @@ pub(crate) enum ArchiveEntryLoadError {
 /// Normal archives select a root/wrapper cover from metadata, then read only
 /// that entry or the naturally first supported image. Nested archives reuse
 /// the bounded, safe temporary extraction path used by Viewer.
-pub(crate) fn load_cover_source_bytes(path: &Path) -> Result<Vec<u8>, AppError> {
+#[cfg(test)]
+pub(crate) fn load_cover_source_bytes(
+    limit: crate::archive::ArchiveExpansionLimit,
+    path: &Path,
+) -> Result<Vec<u8>, AppError> {
+    load_cover_source_bytes_with_cancel(limit, path, &|| false)
+}
+
+pub(crate) fn load_cover_source_bytes_with_cancel(
+    limit: crate::archive::ArchiveExpansionLimit,
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, AppError> {
+    if cancelled() {
+        return Err(AppError::ArchiveCancelled);
+    }
     if is_image_ext(path) {
         return Ok(std::fs::read(path)?);
     }
@@ -56,7 +71,8 @@ pub(crate) fn load_cover_source_bytes(path: &Path) -> Result<Vec<u8>, AppError> 
         ));
     };
 
-    let mut budget = crate::archive::resource::ResourceBudget::default();
+    let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
+    budget.set_cancel_check(cancelled);
     if let Some(bytes) = formats::automatic_cover_hint_bytes(path, &mut budget)? {
         return Ok(bytes);
     }
@@ -117,10 +133,24 @@ pub(crate) fn cover_image_in_folder(folder: &Path) -> Option<std::path::PathBuf>
 /// Loads a stable relative candidate from an archive.  This intentionally
 /// uses the existing bounded nested extraction path; only the relative entry
 /// identifier is persisted, never its temporary extraction location.
+#[cfg(test)]
 pub(crate) fn load_archive_entry_bytes(
+    limit: crate::archive::ArchiveExpansionLimit,
     archive: &Path,
     id: &ArchiveImageId,
 ) -> Result<Vec<u8>, ArchiveEntryLoadError> {
+    load_archive_entry_bytes_with_cancel(limit, archive, id, &|| false)
+}
+
+pub(crate) fn load_archive_entry_bytes_with_cancel(
+    limit: crate::archive::ArchiveExpansionLimit,
+    archive: &Path,
+    id: &ArchiveImageId,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, ArchiveEntryLoadError> {
+    if cancelled() {
+        return Err(AppError::ArchiveCancelled.into());
+    }
     if !id.is_valid() || !archive.is_file() {
         return Err(ArchiveEntryLoadError::Missing);
     }
@@ -129,32 +159,22 @@ pub(crate) fn load_archive_entry_bytes(
         .tempdir()
         .map_err(AppError::from)?;
     let mut current_archive = archive.to_path_buf();
-    let mut budget = crate::archive::resource::ResourceBudget::default();
+    let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
+    budget.set_cancel_check(cancelled);
     for (depth, nested_entry) in id.archives.iter().enumerate() {
         if depth > 10 {
             return Err(
                 AppError::Archive("アーカイブの階層が深すぎます（最大10階層まで）".into()).into(),
             );
         }
-        let nested = match formats::cover_entry_bytes(&current_archive, nested_entry, &mut budget)?
-        {
-            formats::CoverEntryBytes::Bytes(bytes) => {
-                let extension = nested_entry
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .unwrap_or("archive");
-                let nested = temporary.path().join(format!("level-{depth}.{extension}"));
-                budget.write_temp(&nested, &bytes).map_err(AppError::from)?;
-                nested
-            }
-            formats::CoverEntryBytes::Missing => return Err(ArchiveEntryLoadError::Missing),
-            formats::CoverEntryBytes::Unsupported => {
-                let destination = temporary.path().join(format!("level-{depth}"));
-                std::fs::create_dir_all(&destination).map_err(AppError::from)?;
-                formats::extract_to_dir_with_budget(&current_archive, &destination, &mut budget)?;
-                destination.join(nested_entry)
-            }
-        };
+        let destination = temporary.path().join(format!("level-{depth}"));
+        let nested = formats::materialize_nested_entry(
+            &current_archive,
+            nested_entry,
+            &destination,
+            &mut budget,
+        )?
+        .ok_or(ArchiveEntryLoadError::Missing)?;
         if !nested.is_file() || ArchiveFormat::from_path(&nested).is_none() {
             return Err(ArchiveEntryLoadError::Missing);
         }
@@ -225,6 +245,70 @@ mod tests {
     }
 
     #[test]
+    fn missing_nested_cover_candidate_is_distinct_from_corrupt_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("outer.rar");
+        let id = ArchiveImageId {
+            archives: vec![PathBuf::from("inner.rar")],
+            image: PathBuf::from("page.png"),
+        };
+        std::fs::write(
+            &path,
+            super::super::formats::rar_native::stored_rar(&[("page.png", b"image")]),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_archive_entry_bytes(Default::default(), &path, &id),
+            Err(ArchiveEntryLoadError::Missing)
+        ));
+        std::fs::write(
+            &path,
+            super::super::formats::rar_native::stored_rar(&[("inner.rar", b"invalid")]),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_archive_entry_bytes(Default::default(), &path, &id),
+            Err(ArchiveEntryLoadError::Other(AppError::Archive(_)))
+        ));
+    }
+
+    #[test]
+    fn cover_generation_cancel_probe_reaches_nested_materialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("outer.rar");
+        let inner = super::super::formats::rar_native::stored_rar(&[("page.png", b"image")]);
+        std::fs::write(
+            &path,
+            super::super::formats::rar_native::stored_rar(&[("inner.rar", &inner)]),
+        )
+        .unwrap();
+        let id = ArchiveImageId {
+            archives: vec![PathBuf::from("inner.rar")],
+            image: PathBuf::from("page.png"),
+        };
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            load_archive_entry_bytes_with_cancel(Default::default(), &path, &id, &|| {
+                calls.set(calls.get() + 1);
+                false
+            })
+            .unwrap(),
+            b"image"
+        );
+        let stop_at = calls.get() / 2;
+        assert!(stop_at > 1);
+        calls.set(0);
+        assert!(matches!(
+            load_archive_entry_bytes_with_cancel(Default::default(), &path, &id, &|| {
+                calls.set(calls.get() + 1);
+                calls.get() >= stop_at
+            }),
+            Err(ArchiveEntryLoadError::Other(AppError::ArchiveCancelled))
+        ));
+        assert_eq!(calls.get(), stop_at);
+    }
+
+    #[test]
     fn nested_archive_uses_the_first_image_in_viewer_order() {
         let nested_cursor = Cursor::new(Vec::new());
         let mut nested = zip::ZipWriter::new(nested_cursor);
@@ -247,7 +331,7 @@ mod tests {
         outer.write_all(&nested_bytes).unwrap();
         outer.finish().unwrap();
 
-        let bytes = load_cover_source_bytes(&path).unwrap();
+        let bytes = load_cover_source_bytes(Default::default(), &path).unwrap();
         assert_eq!(
             image::load_from_memory(&bytes)
                 .unwrap()
@@ -275,7 +359,7 @@ mod tests {
         }
         archive.finish().unwrap();
 
-        let bytes = load_cover_source_bytes(&path).unwrap();
+        let bytes = load_cover_source_bytes(Default::default(), &path).unwrap();
         assert_eq!(
             image::load_from_memory(&bytes)
                 .unwrap()
@@ -301,7 +385,7 @@ mod tests {
             archive.write_all(&bytes).unwrap();
         }
         archive.finish().unwrap();
-        let bytes = load_cover_source_bytes(&wrapped).unwrap();
+        let bytes = load_cover_source_bytes(Default::default(), &wrapped).unwrap();
         assert_eq!(
             image::load_from_memory(&bytes)
                 .unwrap()
@@ -328,7 +412,7 @@ mod tests {
             .unwrap();
         archive.write_all(&nested_bytes).unwrap();
         archive.finish().unwrap();
-        let bytes = load_cover_source_bytes(&outer).unwrap();
+        let bytes = load_cover_source_bytes(Default::default(), &outer).unwrap();
         assert_eq!(
             image::load_from_memory(&bytes)
                 .unwrap()
@@ -392,6 +476,6 @@ mod tests {
         archive.write_all(b"memo").unwrap();
         archive.finish().unwrap();
 
-        assert!(load_cover_source_bytes(&path).is_err());
+        assert!(load_cover_source_bytes(Default::default(), &path).is_err());
     }
 }

@@ -30,14 +30,16 @@ impl RandomAccessReader {
 
     pub(super) fn read_entry(
         &mut self,
+        limit: crate::archive::ArchiveExpansionLimit,
         entry_index: usize,
         expected_name: &str,
     ) -> Result<Option<gtk::glib::Bytes>, AppError> {
-        read_entry_bytes(&mut self.archive, entry_index, expected_name)
+        read_entry_bytes(limit, &mut self.archive, entry_index, expected_name)
     }
 }
 
 fn read_entry_bytes<R>(
+    limit: crate::archive::ArchiveExpansionLimit,
     archive: &mut zip::ZipArchive<R>,
     entry_index: usize,
     expected_name: &str,
@@ -45,7 +47,7 @@ fn read_entry_bytes<R>(
 where
     R: Read + Seek,
 {
-    let mut budget = crate::archive::resource::ResourceBudget::default();
+    let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
     read_entry_bytes_with_budget(archive, entry_index, expected_name, &mut budget)
         .map(|bytes| bytes.map(gtk::glib::Bytes::from_owned))
 }
@@ -134,7 +136,7 @@ pub(super) fn extract_to_dir(
             std::fs::create_dir_all(parent)?;
         }
         let size = entry.size();
-        budget.copy_to_path(&mut entry, &output_path, Some(size))?;
+        budget.copy_materialized_to_path(&mut entry, &output_path, Some(size))?;
     }
     Ok(())
 }
@@ -176,13 +178,35 @@ pub(super) fn cover_entry_bytes(
     Ok(None)
 }
 
-pub(super) fn load_document(archive_path: &Path) -> Result<Document, AppError> {
+pub(super) fn materialize_nested_entry(
+    archive_path: &Path,
+    entry_path: &Path,
+    output: &Path,
+    budget: &mut crate::archive::resource::ResourceBudget,
+) -> Result<(), AppError> {
+    let file = std::fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(archive_error)?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(archive_error)?;
+        if !entry.is_dir() && Path::new(entry.name()) == entry_path {
+            let size = entry.size();
+            budget.copy_materialized_to_path(&mut entry, output, Some(size))?;
+            return Ok(());
+        }
+    }
+    Err(AppError::Archive("Nested ZIP entry is missing".into()))
+}
+
+pub(super) fn load_document(
+    limit: crate::archive::ArchiveExpansionLimit,
+    archive_path: &Path,
+) -> Result<Document, AppError> {
     let file = std::fs::File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(file).map_err(archive_error)?;
     let mut page_entries = Vec::new();
     let mut all_entries = Vec::new();
 
-    let mut budget = crate::archive::resource::ResourceBudget::default();
+    let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
     for index in 0..archive.len() {
         let entry = archive.by_index(index).map_err(archive_error)?;
         if entry.is_dir() {
@@ -358,7 +382,11 @@ mod tests {
 
         let mut reader = RandomAccessReader::open(&archive_path).unwrap();
         assert_eq!(
-            reader.read_entry(0, "page.jpg").unwrap().unwrap().as_ref(),
+            reader
+                .read_entry(Default::default(), 0, "page.jpg")
+                .unwrap()
+                .unwrap()
+                .as_ref(),
             b"deflated content"
         );
     }

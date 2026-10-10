@@ -4,12 +4,42 @@ use std::io::{Read, Write};
 
 pub(crate) const MIB: u64 = 1024 * 1024;
 pub(crate) const SINGLE_ENTRY_LIMIT: u64 = 64 * MIB;
-pub(crate) const OPERATION_LIMIT: u64 = 512 * MIB;
-pub(crate) const TEMP_WRITE_LIMIT: u64 = 512 * MIB;
-pub(crate) const TEMP_OCCUPANCY_LIMIT: u64 = 512 * MIB;
+pub(crate) const OPERATION_LIMIT: u64 = 4 * 1024 * MIB;
+pub(crate) const TEMP_WRITE_LIMIT: u64 = OPERATION_LIMIT;
+pub(crate) const TEMP_OCCUPANCY_LIMIT: u64 = OPERATION_LIMIT;
 pub(crate) const ENTRY_LIMIT: u64 = 4096;
 pub(crate) const IMAGE_ENTRY_LIMIT: u64 = 4096;
 const IO_CHUNK_SIZE: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ArchiveExpansionLimit {
+    GiB2,
+    #[default]
+    GiB4,
+    GiB8,
+    GiB16,
+}
+
+impl ArchiveExpansionLimit {
+    pub(crate) const ALL: [Self; 4] = [Self::GiB2, Self::GiB4, Self::GiB8, Self::GiB16];
+
+    pub(crate) const fn gib(self) -> i32 {
+        match self {
+            Self::GiB2 => 2,
+            Self::GiB4 => 4,
+            Self::GiB8 => 8,
+            Self::GiB16 => 16,
+        }
+    }
+
+    pub(crate) fn from_gib(value: i32) -> Option<Self> {
+        Self::ALL.into_iter().find(|limit| limit.gib() == value)
+    }
+
+    pub(crate) const fn bytes(self) -> u64 {
+        self.gib() as u64 * 1024 * MIB
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ResourceLimitKind {
@@ -38,6 +68,14 @@ pub(crate) struct ResourceLimits {
 }
 
 impl ResourceLimits {
+    pub(crate) fn for_expansion_limit(limit: ArchiveExpansionLimit) -> Self {
+        Self {
+            cumulative: limit.bytes(),
+            temp_writes: limit.bytes(),
+            temp_occupancy: limit.bytes(),
+            ..Self::PRODUCTION
+        }
+    }
     pub(crate) const PRODUCTION: Self = Self {
         single_entry: SINGLE_ENTRY_LIMIT,
         cumulative: OPERATION_LIMIT,
@@ -48,8 +86,15 @@ impl ResourceLimits {
     };
 }
 
+struct CancelCheck<'a>(&'a dyn Fn() -> bool);
+impl std::fmt::Debug for CancelCheck<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("operation cancel check")
+    }
+}
+
 #[derive(Debug)]
-pub(crate) struct ResourceBudget {
+pub(crate) struct ResourceBudget<'a> {
     limits: ResourceLimits,
     cumulative: u64,
     temp_writes: u64,
@@ -58,15 +103,21 @@ pub(crate) struct ResourceBudget {
     images: u64,
     temp_files: HashMap<std::path::PathBuf, u64>,
     entry_ids: HashMap<(std::path::PathBuf, usize), bool>,
+    cancel: Option<super::ProgressiveArchiveCancelToken>,
+    cancel_check: Option<CancelCheck<'a>>,
 }
 
-impl Default for ResourceBudget {
+impl Default for ResourceBudget<'_> {
     fn default() -> Self {
         Self::new(ResourceLimits::PRODUCTION)
     }
 }
 
-impl ResourceBudget {
+impl<'a> ResourceBudget<'a> {
+    pub(crate) fn for_expansion_limit(limit: ArchiveExpansionLimit) -> Self {
+        Self::new(ResourceLimits::for_expansion_limit(limit))
+    }
+
     pub(crate) fn new(limits: ResourceLimits) -> Self {
         Self {
             limits,
@@ -77,7 +128,79 @@ impl ResourceBudget {
             images: 0,
             temp_files: HashMap::new(),
             entry_ids: HashMap::new(),
+            cancel: None,
+            cancel_check: None,
         }
+    }
+
+    pub(crate) fn set_cancel_token(&mut self, token: &super::ProgressiveArchiveCancelToken) {
+        self.cancel = Some(token.clone());
+    }
+
+    pub(crate) fn set_cancel_check(&mut self, check: &'a dyn Fn() -> bool) {
+        self.cancel_check = Some(CancelCheck(check));
+    }
+
+    pub(crate) fn check_cancel(&self) -> Result<(), AppError> {
+        if self.cancel_check.as_ref().is_some_and(|check| (check.0)())
+            || self
+                .cancel
+                .as_ref()
+                .is_some_and(super::ProgressiveArchiveCancelToken::is_cancelled)
+        {
+            return Err(AppError::ArchiveCancelled);
+        }
+        Ok(())
+    }
+
+    // Only disk materialization callers may select the larger entry allowance.
+    pub(crate) fn materialized_entry_limit(&self, entry: &std::path::Path) -> u64 {
+        if super::is_archive_ext(entry) {
+            self.limits.cumulative
+        } else {
+            self.limits.single_entry
+        }
+    }
+
+    pub(crate) fn preflight_with_limit(&self, size: u64, limit: u64) -> Result<(), AppError> {
+        self.check_cancel()?;
+        if size > limit {
+            return Err(ResourceLimitKind::SingleEntryBytes.into());
+        }
+        Ok(())
+    }
+
+    /// Reserve a decoded chunk before allocation or writing. On I/O failure
+    /// reservations remain conservative; only successful cleanup releases occupancy.
+    pub(crate) fn account_chunk(
+        &mut self,
+        entry_bytes: &mut u64,
+        amount: u64,
+        entry_limit: u64,
+        temp_path: Option<&std::path::Path>,
+    ) -> Result<(), AppError> {
+        self.check_cancel()?;
+        let next_entry = entry_bytes
+            .checked_add(amount)
+            .ok_or(ResourceLimitKind::SingleEntryBytes)?;
+        self.preflight_with_limit(next_entry, entry_limit)?;
+        let cumulative = self
+            .cumulative
+            .checked_add(amount)
+            .ok_or(ResourceLimitKind::CumulativeBytes)?;
+        if cumulative > self.limits.cumulative {
+            return Err(ResourceLimitKind::CumulativeBytes.into());
+        }
+        if let Some(path) = temp_path {
+            self.account_temp_path_write(path, amount)?;
+        }
+        self.cumulative = cumulative;
+        *entry_bytes = next_entry;
+        Ok(())
+    }
+
+    pub(crate) fn limits(&self) -> ResourceLimits {
+        self.limits
     }
 
     #[cfg(test)]
@@ -91,6 +214,7 @@ impl ResourceBudget {
         index: usize,
         image: bool,
     ) -> Result<(), AppError> {
+        self.check_cancel()?;
         let key = (archive.to_path_buf(), index);
         let previous_image = self.entry_ids.get(&key).copied();
         let entries = self
@@ -135,6 +259,7 @@ impl ResourceBudget {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn account_bytes(&mut self, amount: u64) -> Result<(), AppError> {
         self.preflight_entry(amount)?;
         self.consume(amount)
@@ -194,7 +319,7 @@ impl ResourceBudget {
         Ok(())
     }
 
-    fn begin_temp_file(&mut self, path: &std::path::Path) -> Result<(), AppError> {
+    pub(crate) fn begin_temp_file(&mut self, path: &std::path::Path) -> Result<(), AppError> {
         let previous = self.temp_files.get(path).copied().unwrap_or(0);
         self.temp_occupancy = self
             .temp_occupancy
@@ -238,7 +363,7 @@ impl ResourceBudget {
         path: &std::path::Path,
         amount: u64,
     ) -> Result<(), AppError> {
-        self.preflight_entry(amount)?;
+        self.preflight_with_limit(amount, self.materialized_entry_limit(path))?;
         let cumulative = self
             .cumulative
             .checked_add(amount)
@@ -291,32 +416,63 @@ impl ResourceBudget {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn copy_to_path<R: Read + ?Sized>(
         &mut self,
         reader: &mut R,
         path: &std::path::Path,
         expected: Option<u64>,
     ) -> Result<u64, AppError> {
-        if let Some(size) = expected {
-            self.preflight_entry(size)?;
-        }
-        let mut output = std::fs::File::create(path)?;
-        self.begin_temp_file(path)?;
-        self.copy_to_writer(reader, path, &mut output)
+        self.copy_path_with_limit(reader, path, expected, self.limits.single_entry)
     }
 
+    pub(crate) fn copy_materialized_to_path<R: Read + ?Sized>(
+        &mut self,
+        reader: &mut R,
+        path: &std::path::Path,
+        expected: Option<u64>,
+    ) -> Result<u64, AppError> {
+        self.copy_path_with_limit(reader, path, expected, self.materialized_entry_limit(path))
+    }
+
+    fn copy_path_with_limit<R: Read + ?Sized>(
+        &mut self,
+        reader: &mut R,
+        path: &std::path::Path,
+        expected: Option<u64>,
+        limit: u64,
+    ) -> Result<u64, AppError> {
+        if let Some(size) = expected {
+            self.preflight_with_limit(size, limit)?;
+        }
+        self.check_cancel()?;
+        let mut output = std::fs::File::create(path)?;
+        self.begin_temp_file(path)?;
+        self.copy_with_limit(reader, path, &mut output, limit)
+    }
+
+    #[cfg(test)]
     fn copy_to_writer<R: Read + ?Sized, W: Write>(
         &mut self,
         reader: &mut R,
         path: &std::path::Path,
         output: &mut W,
     ) -> Result<u64, AppError> {
+        self.copy_with_limit(reader, path, output, self.limits.single_entry)
+    }
+
+    fn copy_with_limit<R: Read + ?Sized, W: Write>(
+        &mut self,
+        reader: &mut R,
+        path: &std::path::Path,
+        output: &mut W,
+        limit: u64,
+    ) -> Result<u64, AppError> {
         let mut copied = 0u64;
         let mut chunk = [0; IO_CHUNK_SIZE];
         loop {
-            let entry_left = self
-                .limits
-                .single_entry
+            self.check_cancel()?;
+            let entry_left = limit
                 .checked_sub(copied)
                 .ok_or(ResourceLimitKind::SingleEntryBytes)?;
             let cumulative_left = self
@@ -324,26 +480,16 @@ impl ResourceBudget {
                 .cumulative
                 .checked_sub(self.cumulative)
                 .ok_or(ResourceLimitKind::CumulativeBytes)?;
-            let allowance = entry_left.min(cumulative_left);
-            let take = usize::try_from(allowance.saturating_add(1).min(chunk.len() as u64))
-                .unwrap_or(chunk.len());
+            let take = entry_left
+                .min(cumulative_left)
+                .saturating_add(1)
+                .min(chunk.len() as u64) as usize;
             let count = reader.read(&mut chunk[..take])?;
             if count == 0 {
                 break;
             }
-            let amount = count as u64;
-            if amount > entry_left {
-                return Err(ResourceLimitKind::SingleEntryBytes.into());
-            }
-            if amount > cumulative_left {
-                return Err(ResourceLimitKind::CumulativeBytes.into());
-            }
-            self.consume(amount)?;
-            self.account_temp_path_write(path, amount)?;
+            self.account_chunk(&mut copied, count as u64, limit, Some(path))?;
             output.write_all(&chunk[..count])?;
-            copied = copied
-                .checked_add(amount)
-                .ok_or(ResourceLimitKind::SingleEntryBytes)?;
         }
         Ok(copied)
     }
@@ -360,6 +506,7 @@ impl ResourceBudget {
         let mut chunk = [0; IO_CHUNK_SIZE];
         let mut entry_bytes = 0u64;
         loop {
+            self.check_cancel()?;
             let entry_left = self
                 .limits
                 .single_entry
@@ -405,6 +552,7 @@ impl ResourceBudget {
         let mut consumed = 0u64;
         let mut chunk = [0; IO_CHUNK_SIZE];
         loop {
+            self.check_cancel()?;
             let entry_left = self
                 .limits
                 .single_entry
@@ -443,7 +591,271 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    fn tiny() -> ResourceBudget {
+    #[test]
+    fn only_nested_disk_materialization_receives_the_operation_entry_limit() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["image.png", "ordinary.txt", "inner.rar"] {
+            let path = root.path().join(name);
+            let mut budget = ResourceBudget::new(ResourceLimits {
+                single_entry: 4,
+                cumulative: 8,
+                temp_writes: 8,
+                temp_occupancy: 8,
+                entries: 4,
+                images: 4,
+            });
+            let result = budget.copy_materialized_to_path(&mut &b"12345678"[..], &path, Some(8));
+            if name == "inner.rar" {
+                assert_eq!(result.unwrap(), 8);
+                assert_eq!(std::fs::read(&path).unwrap(), b"12345678");
+                assert_eq!(budget.temp_counters(), (8, 8));
+                assert!(matches!(
+                    budget.account_chunk(&mut 8, 1, 8, Some(&path)),
+                    Err(AppError::ArchiveResourceLimit(
+                        ResourceLimitKind::SingleEntryBytes
+                    ))
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(AppError::ArchiveResourceLimit(
+                        ResourceLimitKind::SingleEntryBytes
+                    ))
+                ));
+                assert!(!path.exists());
+            }
+            // Even an archive extension cannot increase a bytes API allowance.
+            assert!(matches!(
+                budget.read_all(&mut &b"12345"[..], Some(5)),
+                Err(AppError::ArchiveResourceLimit(
+                    ResourceLimitKind::SingleEntryBytes
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn callback_chunks_check_every_quota_transactionally_before_output() {
+        for kind in [
+            ResourceLimitKind::SingleEntryBytes,
+            ResourceLimitKind::CumulativeBytes,
+            ResourceLimitKind::TemporaryWrites,
+            ResourceLimitKind::TemporaryOccupancy,
+        ] {
+            let mut limits = ResourceLimits {
+                single_entry: 8,
+                cumulative: 8,
+                temp_writes: 8,
+                temp_occupancy: 8,
+                entries: 4,
+                images: 4,
+            };
+            match kind {
+                ResourceLimitKind::CumulativeBytes => limits.cumulative = 4,
+                ResourceLimitKind::TemporaryWrites => limits.temp_writes = 4,
+                ResourceLimitKind::TemporaryOccupancy => limits.temp_occupancy = 4,
+                _ => {}
+            }
+            let mut budget = ResourceBudget::new(limits);
+            let mut bytes = 0;
+            let limit = if kind == ResourceLimitKind::SingleEntryBytes {
+                4
+            } else {
+                8
+            };
+            budget
+                .account_chunk(
+                    &mut bytes,
+                    3,
+                    limit,
+                    Some(std::path::Path::new("inner.rar")),
+                )
+                .unwrap();
+            assert!(
+                matches!(budget.account_chunk(&mut bytes, 2, limit, Some(std::path::Path::new("inner.rar"))), Err(AppError::ArchiveResourceLimit(actual)) if actual == kind)
+            );
+            assert_eq!(bytes, 3);
+            assert_eq!(budget.cumulative, 3);
+            assert_eq!(budget.temp_counters(), (3, 3));
+        }
+        let mut budget = ResourceBudget::default();
+        let mut overflowed = u64::MAX;
+        assert!(matches!(
+            budget.account_chunk(&mut overflowed, 1, u64::MAX, None),
+            Err(AppError::ArchiveResourceLimit(
+                ResourceLimitKind::SingleEntryBytes
+            ))
+        ));
+        for kind in [
+            ResourceLimitKind::CumulativeBytes,
+            ResourceLimitKind::TemporaryWrites,
+            ResourceLimitKind::TemporaryOccupancy,
+        ] {
+            let mut budget = ResourceBudget::new(ResourceLimits {
+                single_entry: u64::MAX,
+                cumulative: u64::MAX,
+                temp_writes: u64::MAX,
+                temp_occupancy: u64::MAX,
+                entries: 4,
+                images: 4,
+            });
+            match kind {
+                ResourceLimitKind::CumulativeBytes => budget.cumulative = u64::MAX,
+                ResourceLimitKind::TemporaryWrites => budget.temp_writes = u64::MAX,
+                ResourceLimitKind::TemporaryOccupancy => budget.temp_occupancy = u64::MAX,
+                _ => unreachable!(),
+            }
+            let before = (budget.cumulative, budget.temp_counters());
+            let mut entry = 0;
+            assert!(
+                matches!(budget.account_chunk(&mut entry, 1, u64::MAX, Some(std::path::Path::new("inner.rar"))), Err(AppError::ArchiveResourceLimit(actual)) if actual == kind)
+            );
+            assert_eq!(entry, 0);
+            assert_eq!((budget.cumulative, budget.temp_counters()), before);
+        }
+    }
+
+    #[test]
+    fn selected_limits_keep_inclusive_byte_and_disk_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        for limit in ArchiveExpansionLimit::ALL {
+            let maximum = limit.bytes();
+            let limits = ResourceLimits::for_expansion_limit(limit);
+            assert_eq!(limits.single_entry, 64 * MIB);
+            assert_eq!((limits.entries, limits.images), (4096, 4096));
+            assert_eq!(limits.cumulative, maximum);
+            assert_eq!(limits.temp_writes, maximum);
+            assert_eq!(limits.temp_occupancy, maximum);
+            assert_eq!(
+                super::super::formats::SEQUENTIAL_ARCHIVE_MEMORY_LIMIT_BYTES,
+                256 * 1024 * 1024
+            );
+
+            let mut budget = ResourceBudget::for_expansion_limit(limit);
+            budget.preflight(64 * MIB).unwrap();
+            assert!(matches!(
+                budget.preflight(64 * MIB + 1),
+                Err(AppError::ArchiveResourceLimit(
+                    ResourceLimitKind::SingleEntryBytes
+                ))
+            ));
+            // Seed counters rather than allocate or write GiBs of fixture data.
+            budget.consume(maximum - 1).unwrap();
+            assert_eq!(budget.read_all(&mut &b"x"[..], Some(1)).unwrap(), b"x");
+            assert!(matches!(
+                budget.read_all(&mut &b"x"[..], None),
+                Err(AppError::ArchiveResourceLimit(
+                    ResourceLimitKind::CumulativeBytes
+                ))
+            ));
+
+            let mut budget = ResourceBudget::for_expansion_limit(limit);
+            let seeded = root.path().join("seeded");
+            let actual = root.path().join("actual");
+            budget
+                .account_temp_path_write(&seeded, maximum - 1)
+                .unwrap();
+            budget.write_temp(&actual, b"x").unwrap();
+            assert_eq!(budget.temp_counters(), (maximum, maximum));
+            assert!(matches!(
+                budget.write_temp(&actual, b"x"),
+                Err(AppError::ArchiveResourceLimit(
+                    ResourceLimitKind::TemporaryWrites
+                ))
+            ));
+            budget.release_temp_tree(root.path()).unwrap();
+            assert_eq!(budget.temp_counters(), (maximum, 0));
+            assert!(matches!(
+                budget.write_temp(&actual, b"x"),
+                Err(AppError::ArchiveResourceLimit(
+                    ResourceLimitKind::TemporaryWrites
+                ))
+            ));
+
+            let mut budget = ResourceBudget::new(ResourceLimits {
+                temp_writes: u64::MAX,
+                ..limits
+            });
+            budget.account_temp_path_write(&seeded, maximum).unwrap();
+            assert!(matches!(
+                budget.write_temp(&actual, b"x"),
+                Err(AppError::ArchiveResourceLimit(
+                    ResourceLimitKind::TemporaryOccupancy
+                ))
+            ));
+            assert_eq!(std::fs::read(&actual).unwrap(), b"x");
+        }
+    }
+
+    #[test]
+    fn default_budget_allows_more_than_the_previous_512_mib_limit() {
+        assert_eq!(
+            ArchiveExpansionLimit::default(),
+            ArchiveExpansionLimit::GiB4
+        );
+        let mut budget = ResourceBudget::default();
+        for _ in 0..9 {
+            budget.account_bytes(64 * MIB).unwrap();
+        }
+        assert_eq!(budget.cumulative, 576 * MIB);
+    }
+
+    #[test]
+    fn active_worker_keeps_its_budget_when_settings_change() {
+        let mut settings = crate::settings::UserSettings {
+            archive_expansion_limit: ArchiveExpansionLimit::GiB2,
+            ..Default::default()
+        };
+        let limit = settings.archive_expansion_limit;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut budget = ResourceBudget::for_expansion_limit(limit);
+            budget.consume(limit.bytes()).unwrap();
+            started_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            budget.consume(1)
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        settings.archive_expansion_limit = ArchiveExpansionLimit::GiB16;
+        let mut next = ResourceBudget::for_expansion_limit(settings.archive_expansion_limit);
+        next.consume(limit.bytes() + 1).unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(AppError::ArchiveResourceLimit(
+                ResourceLimitKind::CumulativeBytes
+            ))
+        ));
+    }
+
+    #[test]
+    fn disk_full_remains_an_io_error_and_temp_tree_is_released() {
+        struct FullDisk;
+        impl Write for FullDisk {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::StorageFull.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let path = root.join("partial");
+        std::fs::write(&path, []).unwrap();
+        let mut budget = ResourceBudget::for_expansion_limit(ArchiveExpansionLimit::GiB16);
+        budget.begin_temp_file(&path).unwrap();
+        assert!(
+            matches!(budget.copy_to_writer(&mut &b"x"[..], &path, &mut FullDisk), Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::StorageFull)
+        );
+        drop(directory);
+        budget.release_temp_tree(&root).unwrap();
+        assert!(!path.exists());
+        assert_eq!(budget.temp_counters(), (1, 0));
+    }
+
+    fn tiny() -> ResourceBudget<'static> {
         ResourceBudget::new(ResourceLimits {
             single_entry: 4,
             cumulative: 6,

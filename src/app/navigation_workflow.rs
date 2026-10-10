@@ -151,7 +151,7 @@ impl App {
             self.render_history_panel(sender);
         } else {
             let jobs = self.navigation.history_view.resume();
-            Self::spawn_history_cover_jobs(jobs, sender);
+            Self::spawn_history_cover_jobs(self.settings.archive_expansion_limit, jobs, sender);
         }
     }
 
@@ -191,10 +191,14 @@ impl App {
             sender.clone(),
         );
         self.navigation.panel.mark_clean(NavigationPanel::History);
-        Self::spawn_history_cover_jobs(jobs, sender);
+        Self::spawn_history_cover_jobs(self.settings.archive_expansion_limit, jobs, sender);
     }
 
-    pub(super) fn spawn_history_cover_jobs(jobs: Vec<HistoryCoverJob>, sender: &AppSender) {
+    pub(super) fn spawn_history_cover_jobs(
+        limit: crate::archive::ArchiveExpansionLimit,
+        jobs: Vec<HistoryCoverJob>,
+        sender: &AppSender,
+    ) {
         for job in jobs {
             match job {
                 HistoryCoverJob::LoadCache { generation, source } => {
@@ -223,11 +227,12 @@ impl App {
                 } => {
                     let sender = sender.clone();
                     spawn_background(move || {
-                        let result =
-                            generate_and_cache_bookshelf_thumbnail_with_cancel(&source, &|| {
-                                cancel.cancelled()
-                            })
-                            .map_err(|error| error.to_string());
+                        let result = generate_and_cache_bookshelf_thumbnail_with_cancel(
+                            limit,
+                            &source,
+                            &|| cancel.cancelled(),
+                        )
+                        .map_err(|error| error.to_string());
                         let result = cover_cancel::fit_generated_cover(
                             result,
                             super::history::HISTORY_COVER_WIDTH as u32,
@@ -250,7 +255,7 @@ impl App {
             self.render_favorites_panel(sender);
         } else {
             let jobs = self.navigation.favorites_view.resume();
-            Self::spawn_favorites_cover_jobs(jobs, sender);
+            Self::spawn_favorites_cover_jobs(self.settings.archive_expansion_limit, jobs, sender);
         }
     }
 
@@ -278,10 +283,14 @@ impl App {
             sender.clone(),
         );
         self.navigation.panel.mark_clean(NavigationPanel::Favorites);
-        Self::spawn_favorites_cover_jobs(jobs, sender);
+        Self::spawn_favorites_cover_jobs(self.settings.archive_expansion_limit, jobs, sender);
     }
 
-    pub(super) fn spawn_favorites_cover_jobs(jobs: Vec<FavoritesCoverJob>, sender: &AppSender) {
+    pub(super) fn spawn_favorites_cover_jobs(
+        limit: crate::archive::ArchiveExpansionLimit,
+        jobs: Vec<FavoritesCoverJob>,
+        sender: &AppSender,
+    ) {
         for job in jobs {
             match job {
                 FavoritesCoverJob::LoadCache {
@@ -323,11 +332,12 @@ impl App {
                 } => {
                     let sender = sender.clone();
                     spawn_background(move || {
-                        let result =
-                            generate_and_cache_bookshelf_thumbnail_with_cancel(&source, &|| {
-                                cancel.cancelled()
-                            })
-                            .map_err(|error| error.to_string());
+                        let result = generate_and_cache_bookshelf_thumbnail_with_cancel(
+                            limit,
+                            &source,
+                            &|| cancel.cancelled(),
+                        )
+                        .map_err(|error| error.to_string());
                         let result = cover_cancel::fit_generated_cover(
                             result,
                             super::favorites::COVER_WIDTH as u32,

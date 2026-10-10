@@ -11,10 +11,25 @@ use crate::error::AppError;
 use std::path::{Path, PathBuf};
 
 /// 与えられたパスから表示用の `Document` と初期ページインデックスを返します。
-pub(crate) fn load_document_from_path(path: &Path) -> Result<(Document, usize), AppError> {
-    match load_document_from_path_impl(path, None)? {
+#[cfg(test)]
+pub(crate) fn load_document_from_path(
+    limit: crate::archive::ArchiveExpansionLimit,
+    path: &Path,
+) -> Result<(Document, usize), AppError> {
+    match load_document_from_path_impl(limit, path, None, None)? {
         ProgressiveArchiveLoadOutcome::Complete(document) => Ok(document),
         ProgressiveArchiveLoadOutcome::Cancelled => unreachable!("non-progressive load"),
+    }
+}
+
+pub(crate) fn load_document_from_path_with_cancel(
+    limit: crate::archive::ArchiveExpansionLimit,
+    path: &Path,
+    cancel: &ProgressiveArchiveCancelToken,
+) -> Result<ProgressiveArchiveLoadOutcome<(Document, usize)>, AppError> {
+    match load_document_from_path_impl(limit, path, None, Some(cancel)) {
+        Err(AppError::ArchiveCancelled) => Ok(ProgressiveArchiveLoadOutcome::Cancelled),
+        result => result,
     }
 }
 
@@ -22,6 +37,7 @@ pub(crate) fn load_document_from_path(path: &Path) -> Result<(Document, usize), 
 /// 各画像を共通形式で通知しながら読み込みます。通知非対応backendとnested archiveは
 /// 従来の一括読み込み経路を使用します。
 pub(crate) fn load_document_from_path_with_sequential_progress(
+    limit: crate::archive::ArchiveExpansionLimit,
     path: &Path,
     cancel_token: &ProgressiveArchiveCancelToken,
     mut on_image: impl FnMut(super::ProgressiveArchiveImage),
@@ -30,12 +46,21 @@ pub(crate) fn load_document_from_path_with_sequential_progress(
         return Ok(ProgressiveArchiveLoadOutcome::Cancelled);
     }
 
-    load_document_from_path_impl(path, Some((&mut on_image, cancel_token)))
+    match load_document_from_path_impl(
+        limit,
+        path,
+        Some((&mut on_image, cancel_token)),
+        Some(cancel_token),
+    ) {
+        Err(AppError::ArchiveCancelled) => Ok(ProgressiveArchiveLoadOutcome::Cancelled),
+        result => result,
+    }
 }
 
 /// Sequential archive contents専用に画像を1件ずつ通知します。Viewer用の
 /// `Document` や全画像collectionは構築しません。
 pub(crate) fn stream_sequential_archive_images(
+    limit: crate::archive::ArchiveExpansionLimit,
     path: &Path,
     cancel_token: &ProgressiveArchiveCancelToken,
     mut on_image: impl FnMut(super::SequentialArchiveImage),
@@ -50,16 +75,24 @@ pub(crate) fn stream_sequential_archive_images(
             "逐次archive thumbnail streamに対応していません".into(),
         ));
     }
-    formats::stream_sequential_images(path, cancel_token, &mut on_image)
+    match formats::stream_sequential_images(limit, path, cancel_token, &mut on_image) {
+        Err(AppError::ArchiveCancelled) => Ok(ProgressiveArchiveLoadOutcome::Cancelled),
+        result => result,
+    }
 }
 
 fn load_document_from_path_impl(
+    limit: crate::archive::ArchiveExpansionLimit,
     path: &Path,
     progressive: Option<(
         &mut dyn FnMut(super::ProgressiveArchiveImage),
         &ProgressiveArchiveCancelToken,
     )>,
+    cancel: Option<&ProgressiveArchiveCancelToken>,
 ) -> Result<ProgressiveArchiveLoadOutcome<(Document, usize)>, AppError> {
+    if cancel.is_some_and(ProgressiveArchiveCancelToken::is_cancelled) {
+        return Ok(ProgressiveArchiveLoadOutcome::Cancelled);
+    }
     if is_image_ext(path) {
         if is_cover_image(path) {
             let is_wide = image::image_dimensions(path)
@@ -102,7 +135,10 @@ fn load_document_from_path_impl(
             return Ok(ProgressiveArchiveLoadOutcome::Cancelled);
         }
         let temp_directory = tempfile::Builder::new().prefix("agnam-").tempdir()?;
-        let mut budget = crate::archive::resource::ResourceBudget::default();
+        let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
+        if let Some(cancel) = cancel {
+            budget.set_cancel_token(cancel);
+        }
         let entries = extract_images_with_identities(path, temp_directory.path(), &mut budget)?;
 
         if progressive
@@ -111,6 +147,7 @@ fn load_document_from_path_impl(
         {
             return Ok(ProgressiveArchiveLoadOutcome::Cancelled);
         }
+        budget.check_cancel()?;
         let document = build_document_from_archive_images(
             path.to_path_buf(),
             entries,
@@ -124,12 +161,12 @@ fn load_document_from_path_impl(
             if archive_supports_sequential_progress(path)
                 && archive_access_strategy(path)? == Some(ArchiveAccessStrategy::Sequential) =>
         {
-            formats::load_sequential_document_with_progress(path, cancel_token, on_image)?
+            formats::load_sequential_document_with_progress(limit, path, cancel_token, on_image)?
         }
         Some((_, cancel_token)) if cancel_token.is_cancelled() => {
             ProgressiveArchiveLoadOutcome::Cancelled
         }
-        _ => ProgressiveArchiveLoadOutcome::Complete(formats::load_document(path)?),
+        _ => ProgressiveArchiveLoadOutcome::Complete(formats::load_document(limit, path)?),
     };
     Ok(match document {
         ProgressiveArchiveLoadOutcome::Complete(document) => {
@@ -244,7 +281,8 @@ mod tests {
         std::fs::write(directory.path().join("ignored.gif"), b"not an image").unwrap();
         let selected = directory.path().join("2.png");
 
-        let (document, initial_index) = load_document_from_path(&selected).unwrap();
+        let (document, initial_index) =
+            load_document_from_path(Default::default(), &selected).unwrap();
 
         let names = document
             .assets
@@ -275,7 +313,7 @@ mod tests {
         let selected = directory.path().join("001.png");
         std::fs::write(&selected, png(4, 8)).unwrap();
 
-        let (document, _) = load_document_from_path(&selected).unwrap();
+        let (document, _) = load_document_from_path(Default::default(), &selected).unwrap();
         assert_eq!(document.assets.len(), 1);
         assert_eq!(
             document.assets[0].source.as_file_path(),
@@ -290,7 +328,8 @@ mod tests {
         std::fs::write(&cover, png(8, 4)).unwrap();
         std::fs::write(directory.path().join("001.png"), png(4, 8)).unwrap();
 
-        let (document, initial_index) = load_document_from_path(&cover).unwrap();
+        let (document, initial_index) =
+            load_document_from_path(Default::default(), &cover).unwrap();
 
         assert_eq!(initial_index, 0);
         assert_eq!(document.path, cover);
@@ -359,7 +398,8 @@ mod tests {
         writer.write_all(&png(4, 8)).unwrap();
         writer.finish().unwrap();
 
-        let (document, initial_index) = load_document_from_path(&archive_path).unwrap();
+        let (document, initial_index) =
+            load_document_from_path(Default::default(), &archive_path).unwrap();
 
         assert!(document.temp_dir.is_none());
         assert_eq!(initial_index, 0);
@@ -403,7 +443,7 @@ mod tests {
         }
         writer.finish().unwrap();
 
-        let (document, _) = load_document_from_path(&archive_path).unwrap();
+        let (document, _) = load_document_from_path(Default::default(), &archive_path).unwrap();
         let identities = document
             .assets
             .iter()
@@ -435,7 +475,7 @@ mod tests {
         }
         writer.finish().unwrap();
 
-        let (document, _) = load_document_from_path(&archive_path).unwrap();
+        let (document, _) = load_document_from_path(Default::default(), &archive_path).unwrap();
         assert_eq!(document.assets.len(), 1);
         assert_eq!(
             document.assets[0]
@@ -457,11 +497,13 @@ mod tests {
         let cancel_token = ProgressiveArchiveCancelToken::default();
         let mut notification_count = 0;
 
-        let outcome =
-            load_document_from_path_with_sequential_progress(&archive_path, &cancel_token, |_| {
-                notification_count += 1
-            })
-            .unwrap();
+        let outcome = load_document_from_path_with_sequential_progress(
+            Default::default(),
+            &archive_path,
+            &cancel_token,
+            |_| notification_count += 1,
+        )
+        .unwrap();
         let ProgressiveArchiveLoadOutcome::Complete((document, initial_index)) = outcome else {
             panic!("non-solid 7z load should complete normally");
         };
@@ -501,7 +543,8 @@ mod tests {
         outer_writer.write_all(&nested_bytes).unwrap();
         outer_writer.finish().unwrap();
 
-        let (document, initial_index) = load_document_from_path(&archive_path).unwrap();
+        let (document, initial_index) =
+            load_document_from_path(Default::default(), &archive_path).unwrap();
 
         assert_eq!(initial_index, 0);
         assert_eq!(document.assets.len(), 1);
@@ -545,7 +588,8 @@ mod tests {
         let archive_path = directory.path().join("outer.7z");
         write_non_solid_7z(&archive_path, vec![("nested.cbz", nested_bytes)]);
 
-        let (document, initial_index) = load_document_from_path(&archive_path).unwrap();
+        let (document, initial_index) =
+            load_document_from_path(Default::default(), &archive_path).unwrap();
 
         assert_eq!(initial_index, 0);
         assert_eq!(document.assets.len(), 1);

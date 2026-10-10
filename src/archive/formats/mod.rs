@@ -1,5 +1,6 @@
 mod lha;
 mod rar;
+pub(super) mod rar_native;
 mod seven_zip;
 mod tar;
 mod zip;
@@ -71,15 +72,16 @@ impl RandomAccessArchiveReader {
 
     pub(super) fn read_entry(
         &mut self,
+        limit: crate::archive::ArchiveExpansionLimit,
         entry_index: usize,
         expected_name: &str,
     ) -> Result<Option<glib::Bytes>, AppError> {
         match &mut self.backend {
             RandomAccessArchiveReaderBackend::Zip(reader) => {
-                reader.read_entry(entry_index, expected_name)
+                reader.read_entry(limit, entry_index, expected_name)
             }
             RandomAccessArchiveReaderBackend::SevenZip(reader) => {
-                reader.read_entry(entry_index, expected_name)
+                reader.read_entry(limit, entry_index, expected_name)
             }
         }
     }
@@ -113,6 +115,7 @@ pub(super) fn extract_to_dir_with_budget(
     destination: &Path,
     budget: &mut crate::archive::resource::ResourceBudget,
 ) -> Result<(), AppError> {
+    budget.check_cancel()?;
     match ArchiveFormat::from_path(archive_path) {
         Some(ArchiveFormat::Zip) => zip::extract_to_dir(archive_path, destination, budget),
         Some(ArchiveFormat::Rar) => rar::extract_to_dir(archive_path, destination, budget),
@@ -123,6 +126,47 @@ pub(super) fn extract_to_dir_with_budget(
         Some(ArchiveFormat::Lha) => lha::extract_to_dir(archive_path, destination, budget),
         None => Err(unsupported_archive_error()),
     }
+}
+
+/// Materializes an actual nested archive to a workspace-owned path. Image
+/// byte APIs never receive the larger limit. Sequential backends retain their
+/// existing whole-level extraction semantics.
+pub(super) fn materialize_nested_entry(
+    archive: &Path,
+    entry: &Path,
+    destination: &Path,
+    budget: &mut crate::archive::resource::ResourceBudget,
+) -> Result<Option<PathBuf>, AppError> {
+    if !crate::archive::is_normal_relative_path(entry) || !crate::archive::is_archive_ext(entry) {
+        return Err(AppError::Archive("Invalid nested archive entry".into()));
+    }
+    budget.check_cancel()?;
+    // Count the containing level before large writes. Missing logical
+    // candidates remain distinct from corrupt/decode/I/O failure.
+    if !entry_paths_with_budget(archive, budget)?
+        .iter()
+        .any(|path| path == entry)
+    {
+        return Ok(None);
+    }
+    let output = crate::archive::safety::safe_archive_output_path(destination, entry)?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match ArchiveFormat::from_path(archive) {
+        Some(ArchiveFormat::Zip) => zip::materialize_nested_entry(archive, entry, &output, budget)?,
+        Some(ArchiveFormat::SevenZip)
+            if seven_zip::access_strategy(archive)?
+                == crate::archive::ArchiveAccessStrategy::RandomAccess =>
+        {
+            seven_zip::materialize_nested_entry(archive, entry, &output, budget)?;
+        }
+        _ => extract_to_dir_with_budget(archive, destination, budget)?,
+    }
+    if !output.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(output))
 }
 
 /// Lists file entry names from archive metadata without decoding image bytes.
@@ -171,42 +215,47 @@ pub(super) fn cover_entry_bytes(
     }
 }
 
-pub(super) fn load_document(archive_path: &Path) -> Result<Document, AppError> {
+pub(super) fn load_document(
+    limit: crate::archive::ArchiveExpansionLimit,
+    archive_path: &Path,
+) -> Result<Document, AppError> {
     match ArchiveFormat::from_path(archive_path) {
-        Some(ArchiveFormat::Zip) => zip::load_document(archive_path),
-        Some(ArchiveFormat::Rar) => rar::load_document(archive_path),
-        Some(ArchiveFormat::SevenZip) => seven_zip::load_document(archive_path),
-        Some(ArchiveFormat::Tar) => tar::load_document(archive_path),
-        Some(ArchiveFormat::Lha) => lha::load_document(archive_path),
+        Some(ArchiveFormat::Zip) => zip::load_document(limit, archive_path),
+        Some(ArchiveFormat::Rar) => rar::load_document(limit, archive_path),
+        Some(ArchiveFormat::SevenZip) => seven_zip::load_document(limit, archive_path),
+        Some(ArchiveFormat::Tar) => tar::load_document(limit, archive_path),
+        Some(ArchiveFormat::Lha) => lha::load_document(limit, archive_path),
         None => Err(unsupported_archive_error()),
     }
 }
 
 pub(super) fn load_sequential_document_with_progress(
+    limit: crate::archive::ArchiveExpansionLimit,
     archive_path: &Path,
     cancel_token: &crate::archive::ProgressiveArchiveCancelToken,
     on_image: &mut dyn FnMut(crate::archive::ProgressiveArchiveImage),
 ) -> Result<crate::archive::ProgressiveArchiveLoadOutcome<Document>, AppError> {
     match ArchiveFormat::from_path(archive_path) {
         Some(ArchiveFormat::Rar) => {
-            rar::load_document_with_progress(archive_path, cancel_token, on_image)
+            rar::load_document_with_progress(limit, archive_path, cancel_token, on_image)
         }
         Some(ArchiveFormat::SevenZip) => {
-            seven_zip::load_document_with_progress(archive_path, cancel_token, on_image)
+            seven_zip::load_document_with_progress(limit, archive_path, cancel_token, on_image)
         }
         _ => Err(unsupported_archive_error()),
     }
 }
 
 pub(super) fn stream_sequential_images(
+    limit: crate::archive::ArchiveExpansionLimit,
     archive_path: &Path,
     cancel_token: &crate::archive::ProgressiveArchiveCancelToken,
     on_image: &mut dyn FnMut(crate::archive::SequentialArchiveImage),
 ) -> Result<crate::archive::ProgressiveArchiveLoadOutcome<()>, AppError> {
     match ArchiveFormat::from_path(archive_path) {
-        Some(ArchiveFormat::Rar) => rar::stream_images(archive_path, cancel_token, on_image),
+        Some(ArchiveFormat::Rar) => rar::stream_images(limit, archive_path, cancel_token, on_image),
         Some(ArchiveFormat::SevenZip) => {
-            seven_zip::stream_images(archive_path, cancel_token, on_image)
+            seven_zip::stream_images(limit, archive_path, cancel_token, on_image)
         }
         _ => Err(unsupported_archive_error()),
     }
@@ -734,9 +783,12 @@ mod tests {
         for path in [Path::new("missing.rar"), Path::new("missing.7z")] {
             let cancel_token = crate::archive::ProgressiveArchiveCancelToken::default();
             cancel_token.cancel();
-            let outcome = load_sequential_document_with_progress(path, &cancel_token, &mut |_| {
-                panic!("cancelled load must not notify")
-            })
+            let outcome = load_sequential_document_with_progress(
+                Default::default(),
+                path,
+                &cancel_token,
+                &mut |_| panic!("cancelled load must not notify"),
+            )
             .unwrap();
 
             assert!(matches!(

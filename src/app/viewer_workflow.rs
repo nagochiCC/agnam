@@ -760,6 +760,7 @@ impl App {
     ) {
         let preparation = self.viewer.smart_crop.handle();
         self.viewer.session.decode_preloaded(
+            self.settings.archive_expansion_limit,
             document_generation,
             asset_id,
             page_index,

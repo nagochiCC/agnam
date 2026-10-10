@@ -81,6 +81,7 @@ fn image_plan_with_options(
     include_cover_only: bool,
     budget: &mut crate::archive::resource::ResourceBudget,
 ) -> Result<ProgressiveArchiveLoadOutcome<Vec<PlannedImage>>, AppError> {
+    let _native_guard = super::rar_native::lock();
     let archive = unrar::Archive::new(archive_path)
         .open_for_listing()
         .map_err(archive_error)?;
@@ -118,6 +119,7 @@ fn static_count_entry(
     budget.entry(archive_path, archive_index, file && is_image_ext(name))
 }
 
+#[cfg(test)]
 fn check_rar_size_before_read(
     size: u64,
     budget: &crate::archive::resource::ResourceBudget,
@@ -154,6 +156,7 @@ fn is_nested_archive_entry(is_file: bool, filename: &str) -> bool {
 }
 
 pub(super) fn has_nested_archives(archive_path: &Path) -> bool {
+    let _native_guard = super::rar_native::lock();
     let archive = match unrar::Archive::new(archive_path).open_for_listing() {
         Ok(archive) => archive,
         Err(_) => return false,
@@ -172,6 +175,7 @@ pub(super) fn has_nested_archives(archive_path: &Path) -> bool {
 }
 
 pub(super) fn has_viewable_content(archive_path: &Path) -> Result<bool, AppError> {
+    let _native_guard = super::rar_native::lock();
     let archive = unrar::Archive::new(archive_path)
         .open_for_listing()
         .map_err(archive_error)?;
@@ -189,6 +193,7 @@ pub(super) fn entry_paths(
     archive_path: &Path,
     budget: &mut crate::archive::resource::ResourceBudget,
 ) -> Result<Vec<std::path::PathBuf>, AppError> {
+    let _native_guard = super::rar_native::lock();
     let archive = unrar::Archive::new(archive_path)
         .open_for_listing()
         .map_err(archive_error)?;
@@ -214,6 +219,7 @@ pub(super) fn automatic_cover_entry_bytes(
     budget: &mut crate::archive::resource::ResourceBudget,
 ) -> Result<super::CoverEntryBytes, AppError> {
     let expected_name = entry_path.to_string_lossy().into_owned();
+    let _native_guard = super::rar_native::lock();
     let archive = unrar::Archive::new(archive_path)
         .open_for_listing()
         .map_err(archive_error)?;
@@ -228,6 +234,7 @@ pub(super) fn automatic_cover_entry_bytes(
     let Some(target_index) = target_index else {
         return Ok(super::CoverEntryBytes::Missing);
     };
+    drop(_native_guard);
     read_entry_bytes(archive_path, target_index, &expected_name, budget)
         .map(super::CoverEntryBytes::Bytes)
 }
@@ -237,59 +244,49 @@ pub(super) fn extract_to_dir(
     destination: &Path,
     budget: &mut crate::archive::resource::ResourceBudget,
 ) -> Result<(), AppError> {
-    let mut archive = unrar::Archive::new(archive_path)
-        .open_for_processing()
-        .map_err(archive_error)?;
-    let mut archive_index = 0usize;
-
-    loop {
-        archive = match archive.read_header() {
-            Ok(Some(header)) => {
-                let current_index = archive_index;
-                archive_index = archive_index
-                    .checked_add(1)
-                    .ok_or(crate::archive::ResourceLimitKind::EntryCount)?;
-                let filename = header.entry().filename.to_string_lossy().into_owned();
-                budget.entry(
-                    archive_path,
-                    current_index,
-                    header.entry().is_file() && is_image_ext(Path::new(&filename)),
-                )?;
-                if is_macos_metadata(&filename) {
-                    header.skip().map_err(archive_error)?
-                } else {
-                    let output_path = safe_archive_output_path(destination, Path::new(&filename))?;
-                    if !header.entry().is_file() {
-                        header.skip().map_err(archive_error)?
-                    } else {
-                        check_rar_size_before_read(header.entry().unpacked_size, budget)?;
-                        if let Some(parent) = output_path.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        match header.read() {
-                            Ok((data, next)) => {
-                                budget.account_bytes(data.len() as u64)?;
-                                budget.write_temp(&output_path, &data)?;
-                                next
-                            }
-                            Err(error) => {
-                                return Err(AppError::Archive(format!(
-                                    "RARファイル '{filename}' の展開失敗: {error}"
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(None) => break,
-            Err(error) => return Err(AppError::Archive(error.to_string())),
-        };
+    let mut archive = super::rar_native::Archive::open(archive_path)?;
+    let mut index = 0;
+    while let Some(entry) = archive.read_header()? {
+        budget.entry(
+            archive_path,
+            index,
+            entry.is_file && is_image_ext(&entry.filename),
+        )?;
+        index += 1;
+        if is_macos_metadata(&entry.filename.to_string_lossy()) {
+            archive.skip(&entry, budget)?;
+            continue;
+        }
+        let output = safe_archive_output_path(destination, &entry.filename)?;
+        if !entry.is_file {
+            archive.skip(&entry, budget)?;
+            continue;
+        }
+        let limit = budget.materialized_entry_limit(&entry.filename);
+        budget.preflight_with_limit(entry.size, limit)?;
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::File::create(&output)?;
+        budget.begin_temp_file(&output)?;
+        let result = archive.process(&entry, budget, limit, &mut file, Some(&output));
+        drop(file);
+        if let Err(error) = result {
+            // The caller also owns the full temporary tree. Do not publish a
+            // partial entry, and release occupancy only after successful removal.
+            std::fs::remove_file(&output)?;
+            budget.release_temp_tree(&output)?;
+            return Err(error);
+        }
     }
     Ok(())
 }
 
-pub(super) fn load_document(archive_path: &Path) -> Result<Document, AppError> {
-    match load_document_impl(archive_path, None, None)? {
+pub(super) fn load_document(
+    limit: crate::archive::ArchiveExpansionLimit,
+    archive_path: &Path,
+) -> Result<Document, AppError> {
+    match load_document_impl(limit, archive_path, None, None)? {
         ProgressiveArchiveLoadOutcome::Complete(document) => Ok(document),
         ProgressiveArchiveLoadOutcome::Cancelled => unreachable!("non-progressive RAR load"),
     }
@@ -304,19 +301,21 @@ pub(super) const fn supports_sequential_progress(_archive_path: &Path) -> bool {
 }
 
 pub(super) fn load_document_with_progress(
+    limit: crate::archive::ArchiveExpansionLimit,
     archive_path: &Path,
     cancel_token: &ProgressiveArchiveCancelToken,
     on_image: &mut dyn FnMut(ProgressiveArchiveImage),
 ) -> Result<ProgressiveArchiveLoadOutcome<Document>, AppError> {
-    load_document_impl(archive_path, Some(cancel_token), Some(on_image))
+    load_document_impl(limit, archive_path, Some(cancel_token), Some(on_image))
 }
 
 pub(super) fn stream_images(
+    limit: crate::archive::ArchiveExpansionLimit,
     archive_path: &Path,
     cancel_token: &ProgressiveArchiveCancelToken,
     on_image: &mut dyn FnMut(SequentialArchiveImage),
 ) -> Result<ProgressiveArchiveLoadOutcome<()>, AppError> {
-    let mut budget = crate::archive::resource::ResourceBudget::default();
+    let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
     let plan = match image_plan_with_options(archive_path, Some(cancel_token), true, &mut budget)? {
         ProgressiveArchiveLoadOutcome::Complete(plan) => plan,
         ProgressiveArchiveLoadOutcome::Cancelled => {
@@ -346,72 +345,66 @@ fn process_planned_images(
     budget: &mut crate::archive::resource::ResourceBudget,
     on_image: &mut dyn FnMut(&PlannedImage, usize, Vec<u8>) -> Result<(), AppError>,
 ) -> Result<ProgressiveArchiveLoadOutcome<()>, AppError> {
+    if let Some(token) = cancel_token {
+        budget.set_cancel_token(token);
+    }
     let planned_by_id = plan
         .iter()
         .map(|image| (image.entry_id, image))
         .collect::<HashMap<_, _>>();
-    let mut archive = unrar::Archive::new(archive_path)
-        .open_for_processing()
-        .map_err(archive_error)?;
-    let mut archive_index = 0;
-
-    loop {
-        if cancel_token.is_some_and(ProgressiveArchiveCancelToken::is_cancelled) {
-            return Ok(ProgressiveArchiveLoadOutcome::Cancelled);
+    let result = (|| {
+        if plan.is_empty() {
+            return Ok(());
         }
-        archive = match archive.read_header() {
-            Ok(Some(header)) => {
-                let filename = header.entry().filename.to_string_lossy().into_owned();
-                let entry_id = RarEntryId { archive_index };
-                if planned_by_id.contains_key(&entry_id) {
-                    check_rar_size_before_read(header.entry().unpacked_size, budget)?;
-                    match header.read() {
-                        Ok((data, next)) => {
-                            if cancel_token.is_some_and(ProgressiveArchiveCancelToken::is_cancelled)
-                            {
-                                return Ok(ProgressiveArchiveLoadOutcome::Cancelled);
-                            }
-                            budget.account_bytes(data.len() as u64)?;
-                            if cancel_token.is_some_and(ProgressiveArchiveCancelToken::is_cancelled)
-                            {
-                                return Ok(ProgressiveArchiveLoadOutcome::Cancelled);
-                            }
-                            let planned = planned_image_for_processed_entry(
-                                &planned_by_id,
-                                entry_id,
-                                &filename,
-                            )?;
-                            on_image(planned, plan.len(), data)?;
-                            if cancel_token.is_some_and(ProgressiveArchiveCancelToken::is_cancelled)
-                            {
-                                return Ok(ProgressiveArchiveLoadOutcome::Cancelled);
-                            }
-                            next
-                        }
-                        Err(error) => {
-                            if cancel_token.is_some_and(ProgressiveArchiveCancelToken::is_cancelled)
-                            {
-                                return Ok(ProgressiveArchiveLoadOutcome::Cancelled);
-                            }
-                            eprintln!("[Agnam] メモリ展開に失敗しました ({filename:?}): {error}");
-                            return Err(AppError::Archive(format!(
-                                "ファイル '{filename}' のメモリ展開失敗: {error}"
-                            )));
-                        }
-                    }
-                } else {
-                    header.skip().map_err(archive_error)?
+        let mut archive = super::rar_native::Archive::open(archive_path)?;
+        let mut archive_index = 0;
+        let mut completed_images = 0;
+        while let Some(entry) = archive.read_header()? {
+            budget.entry(
+                archive_path,
+                archive_index,
+                entry.is_file && is_image_ext(&entry.filename),
+            )?;
+            let entry_id = RarEntryId { archive_index };
+            if planned_by_id.contains_key(&entry_id) {
+                let filename = entry.filename.to_string_lossy();
+                let planned =
+                    planned_image_for_processed_entry(&planned_by_id, entry_id, &filename)?;
+                let mut data = Vec::new();
+                archive.process(
+                    &entry,
+                    budget,
+                    budget.limits().single_entry,
+                    &mut data,
+                    None,
+                )?;
+                budget.check_cancel()?;
+                on_image(planned, plan.len(), data)?;
+                budget.check_cancel()?;
+                completed_images += 1;
+                // No successor image needs the solid decoder after this point.
+                if completed_images == plan.len() {
+                    break;
                 }
+            } else {
+                archive.skip(&entry, budget)?;
             }
-            Ok(None) => break,
-            Err(error) => return Err(AppError::Archive(error.to_string())),
-        };
-        archive_index += 1;
+            archive_index += 1;
+        }
+        if completed_images != plan.len() {
+            return Err(AppError::Archive("RAR image plan was not completed".into()));
+        }
+        Ok(())
+    })();
+    match result {
+        Err(AppError::ArchiveCancelled) => Ok(ProgressiveArchiveLoadOutcome::Cancelled),
+        Err(error) => Err(error),
+        Ok(()) => Ok(ProgressiveArchiveLoadOutcome::Complete(())),
     }
-    Ok(ProgressiveArchiveLoadOutcome::Complete(()))
 }
 
 fn load_document_impl(
+    limit: crate::archive::ArchiveExpansionLimit,
     archive_path: &Path,
     cancel_token: Option<&ProgressiveArchiveCancelToken>,
     mut on_image: Option<&mut dyn FnMut(ProgressiveArchiveImage)>,
@@ -419,7 +412,7 @@ fn load_document_impl(
     if cancel_token.is_some_and(ProgressiveArchiveCancelToken::is_cancelled) {
         return Ok(ProgressiveArchiveLoadOutcome::Cancelled);
     }
-    let mut budget = crate::archive::resource::ResourceBudget::default();
+    let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
     let plan = match image_plan(archive_path, cancel_token, &mut budget)? {
         ProgressiveArchiveLoadOutcome::Complete(plan) => plan,
         ProgressiveArchiveLoadOutcome::Cancelled => {
@@ -427,7 +420,7 @@ fn load_document_impl(
         }
     };
     let mut images = SequentialImageStorage::with_capacity(plan.len());
-    let mut storage_budget = crate::archive::resource::ResourceBudget::default();
+    let mut storage_budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
     let outcome = process_planned_images(
         archive_path,
         &plan,
@@ -460,7 +453,7 @@ pub(super) fn first_image_bytes(
     archive_path: &Path,
     budget: &mut crate::archive::resource::ResourceBudget,
 ) -> Result<Option<Vec<u8>>, AppError> {
-    let mut listing_budget = crate::archive::resource::ResourceBudget::default();
+    let mut listing_budget = crate::archive::resource::ResourceBudget::new(budget.limits());
     let plan = match image_plan(archive_path, None, &mut listing_budget)? {
         ProgressiveArchiveLoadOutcome::Complete(plan) => plan,
         ProgressiveArchiveLoadOutcome::Cancelled => unreachable!("cover load has no cancel token"),
@@ -483,41 +476,74 @@ fn read_entry_bytes(
     expected_name: &str,
     budget: &mut crate::archive::resource::ResourceBudget,
 ) -> Result<Vec<u8>, AppError> {
-    let mut archive = unrar::Archive::new(archive_path)
-        .open_for_processing()
-        .map_err(archive_error)?;
-    let mut archive_index = 0;
-    loop {
-        archive = match archive.read_header().map_err(archive_error)? {
-            Some(header) => {
-                let filename = header.entry().filename.to_string_lossy().into_owned();
-                if archive_index == target_index {
-                    if !header.entry().is_file() || filename != expected_name {
-                        return Err(AppError::Archive(format!(
-                            "RAR表紙エントリ一覧と取得結果が一致しません: archive index {archive_index}, expected {expected_name:?}, got {filename:?}"
-                        )));
-                    }
-                    check_rar_size_before_read(header.entry().unpacked_size, budget)?;
-                    let (bytes, _) = header.read().map_err(archive_error)?;
-                    budget.account_bytes(bytes.len() as u64)?;
-                    return Ok(bytes);
-                }
-                header.skip().map_err(archive_error)?
+    let mut archive = super::rar_native::Archive::open(archive_path)?;
+    let mut index = 0;
+    while let Some(entry) = archive.read_header()? {
+        budget.entry(
+            archive_path,
+            index,
+            entry.is_file && is_image_ext(&entry.filename),
+        )?;
+        if index == target_index {
+            if !entry.is_file || entry.filename.to_string_lossy() != expected_name {
+                return Err(AppError::Archive(
+                    "RAR entry listing and payload identity differ".into(),
+                ));
             }
-            None => break,
-        };
-        archive_index += 1;
+            let mut bytes = Vec::new();
+            archive.process(
+                &entry,
+                budget,
+                budget.limits().single_entry,
+                &mut bytes,
+                None,
+            )?;
+            return Ok(bytes);
+        }
+        archive.skip(&entry, budget)?;
+        index += 1;
     }
-    Err(AppError::Archive(format!(
-        "RAR表紙entryが見つかりません: archive index {target_index}, name {expected_name:?}"
-    )))
+    Err(AppError::Archive("RAR cover entry is missing".into()))
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::document::{ImageLayout, ImageSource, PagePart};
     use std::io::Cursor;
+
+    #[test]
+    fn solid_image_plan_stops_before_unneeded_trailing_dependencies() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("solid.rar");
+        std::fs::write(&path, include_bytes!("fixtures/rar5-multiple-solid.rar")).unwrap();
+        let plan = [PlannedImage {
+            entry_id: RarEntryId { archive_index: 1 },
+            entry_name: "test2.bin".into(),
+            physical_index: 0,
+        }];
+        let mut budget = crate::archive::resource::ResourceBudget::new(
+            crate::archive::resource::ResourceLimits {
+                single_entry: 4096,
+                cumulative: 8192,
+                temp_writes: 0,
+                temp_occupancy: 0,
+                entries: 4,
+                images: 4,
+            },
+        );
+        let mut notifications = 0;
+        assert!(matches!(
+            process_planned_images(&path, &plan, None, &mut budget, &mut |_, _, bytes| {
+                assert_eq!(bytes.len(), 4096);
+                notifications += 1;
+                Ok(())
+            })
+            .unwrap(),
+            ProgressiveArchiveLoadOutcome::Complete(())
+        ));
+        assert_eq!(notifications, 1);
+    }
 
     #[test]
     fn rar_size_preflight_and_actual_size_have_distinct_checks() {
@@ -613,7 +639,7 @@ mod tests {
 
     // Small RAR5 fixtures generated once for backend tests. Keeping them
     // embedded avoids requiring a RAR writer or external command in CI.
-    const RAR_WITH_COVER: &[u8] = &[
+    pub(in crate::archive::formats) const RAR_WITH_COVER: &[u8] = &[
         82, 97, 114, 33, 26, 7, 1, 0, 243, 225, 130, 235, 11, 1, 5, 7, 0, 6, 1, 1, 128, 128, 128,
         0, 65, 40, 154, 117, 36, 2, 3, 11, 133, 0, 4, 133, 0, 164, 131, 2, 63, 188, 38, 164, 128,
         0, 1, 6, 49, 48, 46, 112, 110, 103, 10, 3, 19, 230, 166, 138, 106, 81, 110, 41, 26, 97,
@@ -646,7 +672,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let with_cover = directory.path().join("with-cover.rar");
         std::fs::write(&with_cover, RAR_WITH_COVER).unwrap();
-        let cover = crate::archive::cover::load_cover_source_bytes(&with_cover).unwrap();
+        let cover = crate::archive::cover::load_cover_source_bytes(Default::default(), &with_cover)
+            .unwrap();
         assert!(cover.starts_with(b"# Pathnames of valid login shells."));
 
         let without_cover = directory.path().join("without-cover.rar");
@@ -660,7 +687,8 @@ mod tests {
             .is_none()
         );
         assert_eq!(
-            crate::archive::cover::load_cover_source_bytes(&without_cover).unwrap(),
+            crate::archive::cover::load_cover_source_bytes(Default::default(), &without_cover)
+                .unwrap(),
             b"\\S{PRETTY_NAME} \\r (\\l)\n\n"
         );
     }
@@ -889,11 +917,13 @@ mod tests {
     fn already_cancelled_progressive_load_has_a_distinct_outcome() {
         let cancel_token = ProgressiveArchiveCancelToken::default();
         cancel_token.cancel();
-        let outcome =
-            load_document_with_progress(Path::new("missing.rar"), &cancel_token, &mut |_| {
-                panic!("cancelled load must not notify")
-            })
-            .unwrap();
+        let outcome = load_document_with_progress(
+            Default::default(),
+            Path::new("missing.rar"),
+            &cancel_token,
+            &mut |_| panic!("cancelled load must not notify"),
+        )
+        .unwrap();
 
         assert!(matches!(outcome, ProgressiveArchiveLoadOutcome::Cancelled));
     }

@@ -289,7 +289,9 @@ fn measure_real_cover_cost(root: &Path) {
     let full_elapsed = full_start.elapsed();
     let cache = crate::bookshelf::cache::BookshelfThumbnailCache::new(root.join("phase-cache"));
     let cache_start = Instant::now();
-    cache.generate_and_cache(&source).unwrap();
+    cache
+        .generate_and_cache(Default::default(), &source)
+        .unwrap();
     let cache_elapsed = cache_start.elapsed();
     println!(
         "COVER_PHASES: decode_ms={:.2} generate_ms={:.2} generate_cache_ms={:.2} result={}x{}",
@@ -306,7 +308,7 @@ fn measure_real_cover_cost(root: &Path) {
         let tx = tx.clone();
         spawn_background(move || {
             let start = Instant::now();
-            let result = generate_and_cache_bookshelf_thumbnail(&path);
+            let result = generate_and_cache_bookshelf_thumbnail(Default::default(), &path);
             tx.send((n, start.elapsed(), result.is_ok())).unwrap();
         });
     }
@@ -368,23 +370,27 @@ fn measure_real_search_generation_block(root: &Path, cooperative_cancel: bool) {
             peak.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
             let checks = Cell::new(0);
             let cancelled_phase = Cell::new(None);
-            let result = generate_and_cache_bookshelf_thumbnail_with_cancel(&job.source, &|| {
-                let phase = checks.get() + 1;
-                checks.set(phase);
-                if phase == 6 {
-                    // The sixth checkpoint is immediately before image decode.
-                    // Return false so the codec call starts even if the main
-                    // thread switches generation after receiving this signal.
-                    decode_tx.send(()).unwrap();
-                    false
-                } else {
-                    let obsolete = cooperative_cancel && cancel.cancelled();
-                    if obsolete && cancelled_phase.get().is_none() {
-                        cancelled_phase.set(Some(phase));
+            let result = generate_and_cache_bookshelf_thumbnail_with_cancel(
+                Default::default(),
+                &job.source,
+                &|| {
+                    let phase = checks.get() + 1;
+                    checks.set(phase);
+                    if phase == 6 {
+                        // The sixth checkpoint is immediately before image decode.
+                        // Return false so the codec call starts even if the main
+                        // thread switches generation after receiving this signal.
+                        decode_tx.send(()).unwrap();
+                        false
+                    } else {
+                        let obsolete = cooperative_cancel && cancel.cancelled();
+                        if obsolete && cancelled_phase.get().is_none() {
+                            cancelled_phase.set(Some(phase));
+                        }
+                        obsolete
                     }
-                    obsolete
-                }
-            })
+                },
+            )
             .map(|thumbnail| thumbnail.is_none());
             active.fetch_sub(1, Ordering::SeqCst);
             tx.send((job, start, Instant::now(), result, cancelled_phase.get()))
@@ -410,9 +416,11 @@ fn measure_real_search_generation_block(root: &Path, cooperative_cancel: bool) {
     let latest_job = &released.jobs.generations[0];
     let latest_started = Instant::now();
     peak.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
-    let latest_ok = generate_and_cache_bookshelf_thumbnail_with_cancel(&latest_job.source, &|| {
-        cooperative_cancel && scheduler.cancellation_token().cancelled()
-    })
+    let latest_ok = generate_and_cache_bookshelf_thumbnail_with_cancel(
+        Default::default(),
+        &latest_job.source,
+        &|| cooperative_cancel && scheduler.cancellation_token().cancelled(),
+    )
     .is_ok();
     active.fetch_sub(1, Ordering::SeqCst);
     let latest_finished = Instant::now();

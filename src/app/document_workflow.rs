@@ -747,7 +747,15 @@ impl App {
         let load_request_id =
             self.begin_load_request(purpose, DocumentBoundaryLoad::Invalidate, sender);
         let progressive = self.prepare_progressive_archive(load_request_id, &path, initial_page);
-        Self::spawn_path_load(load_request_id, path, initial_page, progressive, sender);
+        Self::spawn_path_load(
+            self.settings.archive_expansion_limit,
+            load_request_id,
+            path,
+            initial_page,
+            progressive,
+            self.document.load.cancel_token(load_request_id),
+            sender,
+        );
     }
 
     pub(super) fn start_archive_image_load(
@@ -763,23 +771,33 @@ impl App {
             sender,
         );
         let sender = sender.clone();
-        spawn_background(move || match load_document_from_path(&path) {
-            Ok((document, _)) => {
-                let Some(initial_index) =
-                    document.first_page_for_archive_image(&id.archives, &id.image)
-                else {
-                    sender.input(Msg::LoadRequestFinished { load_request_id });
-                    return;
-                };
-                sender.input(Msg::OpenDocument {
-                    load_request_id,
-                    document,
-                    initial_index,
-                });
-            }
-            Err(error) => {
-                eprintln!("archive内画像の読み込みに失敗しました: {error}");
-                sender.input(load_failure_message(load_request_id, &error));
+        let limit = self.settings.archive_expansion_limit;
+        let cancel = self.document.load.cancel_token(load_request_id);
+        spawn_background(move || {
+            match load_document_from_path_with_cancel(limit, &path, &cancel) {
+                Ok(ProgressiveArchiveLoadOutcome::Complete((document, _)))
+                    if !cancel.is_cancelled() =>
+                {
+                    let Some(initial_index) =
+                        document.first_page_for_archive_image(&id.archives, &id.image)
+                    else {
+                        sender.input(Msg::LoadRequestFinished { load_request_id });
+                        return;
+                    };
+                    sender.input(Msg::OpenDocument {
+                        load_request_id,
+                        document,
+                        initial_index,
+                    });
+                }
+                Ok(_) | Err(crate::error::AppError::ArchiveCancelled) => {}
+                Err(error) => {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    eprintln!("archive内画像の読み込みに失敗しました: {error}");
+                    sender.input(load_failure_message(load_request_id, &error));
+                }
             }
         });
     }
@@ -793,7 +811,15 @@ impl App {
         let load_request_id =
             self.begin_load_request(LoadPurpose::Normal, DocumentBoundaryLoad::Retain, sender);
         let progressive = self.prepare_progressive_archive(load_request_id, &path, initial_page);
-        Self::spawn_path_load(load_request_id, path, initial_page, progressive, sender);
+        Self::spawn_path_load(
+            self.settings.archive_expansion_limit,
+            load_request_id,
+            path,
+            initial_page,
+            progressive,
+            self.document.load.cancel_token(load_request_id),
+            sender,
+        );
     }
 
     pub(super) fn prepare_progressive_archive(
@@ -819,10 +845,12 @@ impl App {
     }
 
     pub(super) fn spawn_path_load(
+        limit: crate::archive::ArchiveExpansionLimit,
         load_request_id: u64,
         path: std::path::PathBuf,
         initial_page: InitialPage,
         progressive: Option<ProgressiveArchiveCancelToken>,
+        request_cancel: ProgressiveArchiveCancelToken,
         sender: &AppSender,
     ) {
         let sender = sender.clone();
@@ -832,6 +860,7 @@ impl App {
                 let progress_sender = sender.clone();
                 let notification_token = cancel_token.clone();
                 load_document_from_path_with_sequential_progress(
+                    limit,
                     &path,
                     cancel_token,
                     move |image| {
@@ -845,14 +874,15 @@ impl App {
                     },
                 )
             } else {
-                load_document_from_path(&path).map(ProgressiveArchiveLoadOutcome::Complete)
+                load_document_from_path_with_cancel(limit, &path, &request_cancel)
             };
 
             match result {
                 Ok(ProgressiveArchiveLoadOutcome::Complete((document, initial_index)))
-                    if progressive
-                        .as_ref()
-                        .is_none_or(|cancel_token| !cancel_token.is_cancelled()) =>
+                    if !request_cancel.is_cancelled()
+                        && progressive
+                            .as_ref()
+                            .is_none_or(|cancel_token| !cancel_token.is_cancelled()) =>
                 {
                     let initial_index = initial_page.resolve(initial_index, document.pages.len());
                     sender.input(Msg::OpenDocument {
@@ -863,10 +893,12 @@ impl App {
                 }
                 Ok(ProgressiveArchiveLoadOutcome::Complete(_))
                 | Ok(ProgressiveArchiveLoadOutcome::Cancelled) => {}
+                Err(crate::error::AppError::ArchiveCancelled) => {}
                 Err(_)
-                    if progressive
-                        .as_ref()
-                        .is_some_and(ProgressiveArchiveCancelToken::is_cancelled) => {}
+                    if request_cancel.is_cancelled()
+                        || progressive
+                            .as_ref()
+                            .is_some_and(ProgressiveArchiveCancelToken::is_cancelled) => {}
                 Err(error) => {
                     eprintln!("ファイルの読み込みに失敗しました: {error}");
                     sender.input(load_failure_message(load_request_id, &error));
@@ -931,10 +963,12 @@ impl App {
         let progressive =
             self.prepare_progressive_archive(load_request_id, &target.path, initial_page);
         Self::spawn_path_load(
+            self.settings.archive_expansion_limit,
             load_request_id,
             target.path,
             initial_page,
             progressive,
+            self.document.load.cancel_token(load_request_id),
             sender,
         );
     }

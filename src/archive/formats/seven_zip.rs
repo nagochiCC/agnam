@@ -198,6 +198,7 @@ impl RandomAccessReader {
 
     pub(super) fn read_entry(
         &mut self,
+        limit: crate::archive::ArchiveExpansionLimit,
         entry_index: usize,
         expected_name: &str,
     ) -> Result<Option<glib::Bytes>, AppError> {
@@ -205,7 +206,7 @@ impl RandomAccessReader {
             entry_index,
             expected_name,
             None,
-            &mut crate::archive::resource::ResourceBudget::default(),
+            &mut crate::archive::resource::ResourceBudget::for_expansion_limit(limit),
         )
         .map(|bytes| Some(glib::Bytes::from_owned(bytes)))
     }
@@ -279,11 +280,10 @@ impl RandomAccessReader {
             };
             let data = match data {
                 Ok(data) => data,
-                Err(error @ AppError::ArchiveResourceLimit(_)) => {
+                Err(error) => {
                     resource_error = Some(error);
                     return Err(sevenz_rust::Error::other("archive resource limit"));
                 }
-                Err(error) => return Err(sevenz_rust::Error::other(error.to_string())),
             };
             bytes = Some(data);
             Ok(false)
@@ -415,6 +415,55 @@ pub(super) fn cover_entry_bytes(
         .map(super::CoverEntryBytes::Bytes)
 }
 
+pub(super) fn materialize_nested_entry(
+    archive_path: &Path,
+    entry_path: &Path,
+    output: &Path,
+    budget: &mut crate::archive::resource::ResourceBudget,
+) -> Result<(), AppError> {
+    let mut archive = RandomAccessReader::open_result(archive_path)?;
+    let index = archive
+        .archive
+        .files
+        .iter()
+        .position(|entry| !entry.is_directory() && Path::new(entry.name()) == entry_path)
+        .ok_or_else(|| AppError::Archive("Nested 7z entry is missing".into()))?;
+    let entry = &archive.archive.files[index];
+    if !entry.has_stream() {
+        budget.copy_materialized_to_path(&mut std::io::empty(), output, Some(0))?;
+        return Ok(());
+    }
+    let folder = archive.archive.stream_map.file_folder_index[index]
+        .ok_or_else(|| AppError::Archive("Nested 7z entry has no folder".into()))?;
+    let target = std::ptr::from_ref(entry);
+    let mut saved_error = None;
+    let mut found = false;
+    let decoder =
+        sevenz_rust::BlockDecoder::new(folder, &archive.archive, &[], &mut archive.source);
+    let result = decoder.for_each_entries(&mut |entry, reader| {
+        if std::ptr::from_ref(entry) != target {
+            if entry.has_stream() {
+                return Err(sevenz_rust::Error::other("Unexpected 7z stream"));
+            }
+            return Ok(true);
+        }
+        if let Err(error) = budget.copy_materialized_to_path(reader, output, Some(entry.size)) {
+            saved_error = Some(error);
+            return Err(sevenz_rust::Error::other("Nested materialization stopped"));
+        }
+        found = true;
+        Ok(false)
+    });
+    if let Some(error) = saved_error {
+        return Err(error);
+    }
+    result.map_err(archive_error)?;
+    if !found {
+        return Err(AppError::Archive("Nested 7z stream is missing".into()));
+    }
+    Ok(())
+}
+
 pub(super) fn automatic_cover_entry_bytes(
     archive_path: &Path,
     entry_path: &Path,
@@ -446,7 +495,7 @@ pub(super) fn extract_to_dir(
     destination: &Path,
     budget: &mut crate::archive::resource::ResourceBudget,
 ) -> Result<(), AppError> {
-    let mut resource_error = None;
+    let mut saved_error = None;
     let mut entry_index = 0;
     let result = sevenz_rust::decompress_file_with_extract_fn(
         archive_path,
@@ -454,46 +503,50 @@ pub(super) fn extract_to_dir(
         |entry, reader, _default_output_path| {
             let index = entry_index;
             entry_index += 1;
-            let output_path = safe_archive_output_path(destination, Path::new(entry.name()))
-                .map_err(|error| sevenz_rust::Error::other(error.to_string()))?;
-            if let Err(error) = budget.entry(
-                archive_path,
-                index,
-                !entry.is_directory() && is_image_ext(Path::new(entry.name())),
-            ) {
-                resource_error = Some(error);
-                return Err(sevenz_rust::Error::other("archive resource limit"));
-            }
-
-            if entry.is_directory() {
-                std::fs::create_dir_all(&output_path).map_err(sevenz_rust::Error::io)?;
-            } else {
-                if let Some(parent) = output_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(sevenz_rust::Error::io)?;
-                }
-                if let Err(error) = budget.copy_to_path(reader, &output_path, Some(entry.size)) {
-                    if matches!(error, AppError::ArchiveResourceLimit(_)) {
-                        resource_error = Some(error);
+            let extraction = (|| -> Result<(), AppError> {
+                let output_path = safe_archive_output_path(destination, Path::new(entry.name()))?;
+                budget.entry(
+                    archive_path,
+                    index,
+                    !entry.is_directory() && is_image_ext(Path::new(entry.name())),
+                )?;
+                if entry.is_directory() {
+                    std::fs::create_dir_all(&output_path)?;
+                } else {
+                    if let Some(parent) = output_path.parent() {
+                        std::fs::create_dir_all(parent)?;
                     }
-                    return Err(sevenz_rust::Error::other("archive extraction failed"));
+                    budget.copy_materialized_to_path(reader, &output_path, Some(entry.size))?;
+                }
+                Ok(())
+            })();
+            match extraction {
+                Ok(()) => Ok(true),
+                Err(error) => {
+                    saved_error = Some(error);
+                    Err(sevenz_rust::Error::other("archive extraction failed"))
                 }
             }
-            Ok(true)
         },
     );
-    if let Some(error) = resource_error {
+    if let Some(error) = saved_error {
         return Err(error);
     }
     result.map_err(archive_error)
 }
 
-pub(super) fn load_document(archive_path: &Path) -> Result<Document, AppError> {
+pub(super) fn load_document(
+    limit: crate::archive::ArchiveExpansionLimit,
+    archive_path: &Path,
+) -> Result<Document, AppError> {
     match access_strategy(archive_path)? {
-        ArchiveAccessStrategy::RandomAccess => load_random_access_document(archive_path),
-        ArchiveAccessStrategy::Sequential => match load_document_impl(archive_path, None, None)? {
-            ProgressiveArchiveLoadOutcome::Complete(document) => Ok(document),
-            ProgressiveArchiveLoadOutcome::Cancelled => unreachable!("non-progressive 7z load"),
-        },
+        ArchiveAccessStrategy::RandomAccess => load_random_access_document(limit, archive_path),
+        ArchiveAccessStrategy::Sequential => {
+            match load_document_impl(limit, archive_path, None, None)? {
+                ProgressiveArchiveLoadOutcome::Complete(document) => Ok(document),
+                ProgressiveArchiveLoadOutcome::Cancelled => unreachable!("non-progressive 7z load"),
+            }
+        }
     }
 }
 
@@ -506,9 +559,12 @@ pub(super) const fn supports_sequential_progress(_archive_path: &Path) -> bool {
     true
 }
 
-fn load_random_access_document(archive_path: &Path) -> Result<Document, AppError> {
+fn load_random_access_document(
+    limit: crate::archive::ArchiveExpansionLimit,
+    archive_path: &Path,
+) -> Result<Document, AppError> {
     let mut reader = RandomAccessReader::open_result(archive_path)?;
-    let mut budget = crate::archive::resource::ResourceBudget::default();
+    let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
     for (index, entry) in reader.archive.files.iter().enumerate() {
         budget.entry(
             archive_path,
@@ -543,14 +599,16 @@ fn load_random_access_document(archive_path: &Path) -> Result<Document, AppError
 }
 
 pub(super) fn load_document_with_progress(
+    limit: crate::archive::ArchiveExpansionLimit,
     archive_path: &Path,
     cancel_token: &ProgressiveArchiveCancelToken,
     on_image: &mut dyn FnMut(ProgressiveArchiveImage),
 ) -> Result<ProgressiveArchiveLoadOutcome<Document>, AppError> {
-    load_document_impl(archive_path, Some(cancel_token), Some(on_image))
+    load_document_impl(limit, archive_path, Some(cancel_token), Some(on_image))
 }
 
 pub(super) fn stream_images(
+    limit: crate::archive::ArchiveExpansionLimit,
     archive_path: &Path,
     cancel_token: &ProgressiveArchiveCancelToken,
     on_image: &mut dyn FnMut(SequentialArchiveImage),
@@ -560,7 +618,7 @@ pub(super) fn stream_images(
     }
     let archive = SevenZipEntryDecoder::open(archive_path, true).map_err(archive_error)?;
     let plan = image_plan_with_options(&archive.archive().files, true);
-    let mut budget = crate::archive::resource::ResourceBudget::default();
+    let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
     process_planned_images(
         archive_path,
         archive,
@@ -586,6 +644,9 @@ fn process_planned_images(
     budget: &mut crate::archive::resource::ResourceBudget,
     on_image: &mut dyn FnMut(&PlannedImage, usize, Vec<u8>) -> Result<(), AppError>,
 ) -> Result<ProgressiveArchiveLoadOutcome<()>, AppError> {
+    if let Some(cancel) = cancel_token {
+        budget.set_cancel_token(cancel);
+    }
     let planned_by_id = plan
         .iter()
         .map(|image| (image.entry_id, image))
@@ -640,26 +701,25 @@ fn process_planned_images(
 
             let data = match budget.read_all(reader, Some(entry.size)) {
                 Ok(data) => data,
-                Err(error @ AppError::ArchiveResourceLimit(_)) => {
+                Err(error) => {
                     resource_error = Some(error);
                     return Err(sevenz_rust::Error::other("archive resource limit"));
                 }
-                Err(error) => return Err(sevenz_rust::Error::other(error.to_string())),
             };
             if cancel_token.is_some_and(ProgressiveArchiveCancelToken::is_cancelled) {
                 return Ok(false);
             }
-            on_image(planned, plan.len(), data)
-                .map_err(|error| sevenz_rust::Error::other(error.to_string()))?;
+            if let Err(error) = on_image(planned, plan.len(), data) {
+                resource_error = Some(error);
+                return Err(sevenz_rust::Error::other("archive processing failed"));
+            }
             if cancel_token.is_some_and(ProgressiveArchiveCancelToken::is_cancelled) {
                 return Ok(false);
             }
         } else if entry.has_stream() {
             // Solid blockの後続entryをdecodeできるよう、対象外streamも最後まで消費する。
             if let Err(error) = budget.drain(reader, Some(entry.size)) {
-                if matches!(error, AppError::ArchiveResourceLimit(_)) {
-                    resource_error = Some(error);
-                }
+                resource_error = Some(error);
                 return Err(sevenz_rust::Error::other("archive resource limit"));
             }
             if cancel_token.is_some_and(ProgressiveArchiveCancelToken::is_cancelled) {
@@ -690,6 +750,7 @@ fn process_planned_images(
 }
 
 fn load_document_impl(
+    limit: crate::archive::ArchiveExpansionLimit,
     archive_path: &Path,
     cancel_token: Option<&ProgressiveArchiveCancelToken>,
     mut on_image: Option<&mut dyn FnMut(ProgressiveArchiveImage)>,
@@ -701,8 +762,8 @@ fn load_document_impl(
         SevenZipEntryDecoder::open(archive_path, cancel_token.is_some()).map_err(archive_error)?;
     let plan = image_plan(&archive.archive().files);
     let mut images = SequentialImageStorage::with_capacity(plan.len());
-    let mut storage_budget = crate::archive::resource::ResourceBudget::default();
-    let mut budget = crate::archive::resource::ResourceBudget::default();
+    let mut storage_budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
+    let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
     let outcome = process_planned_images(
         archive_path,
         archive,
@@ -786,11 +847,10 @@ fn read_entry_bytes_sequential(
         if !entry.is_directory() && entry.name() == expected_name {
             match budget.read_all(reader, Some(entry.size)) {
                 Ok(bytes) => selected_bytes = Some(bytes),
-                Err(error @ AppError::ArchiveResourceLimit(_)) => {
+                Err(error) => {
                     resource_error = Some(error);
                     return Err(sevenz_rust::Error::other("archive resource limit"));
                 }
-                Err(error) => return Err(sevenz_rust::Error::other(error.to_string())),
             }
             return Ok(false);
         }
@@ -798,9 +858,7 @@ fn read_entry_bytes_sequential(
             // Solid 7z blocks require preceding streams to be consumed to
             // reach the selected entry, but their bytes are never retained.
             if let Err(error) = budget.drain(reader, Some(entry.size)) {
-                if matches!(error, AppError::ArchiveResourceLimit(_)) {
-                    resource_error = Some(error);
-                }
+                resource_error = Some(error);
                 return Err(sevenz_rust::Error::other("archive resource limit"));
             }
         }
@@ -1040,7 +1098,7 @@ mod tests {
             &archive_path,
             vec![("002.png", png(8, 4)), ("001.png", png(4, 8))],
         );
-        let document = load_document(&archive_path).unwrap();
+        let document = load_document(Default::default(), &archive_path).unwrap();
 
         assert_eq!(document.assets.len(), 2);
         assert_eq!(document.pages.len(), 3);
@@ -1119,7 +1177,10 @@ mod tests {
         let selected_folder = reader.archive.stream_map.file_folder_index[2].unwrap();
         assert!(selected_folder > 0);
 
-        let bytes = reader.read_entry(2, "003.png").unwrap().unwrap();
+        let bytes = reader
+            .read_entry(Default::default(), 2, "003.png")
+            .unwrap()
+            .unwrap();
 
         assert_eq!(bytes.as_ref(), last_bytes);
         assert_eq!(reader.decoded_folder_indices, [selected_folder]);
@@ -1141,15 +1202,23 @@ mod tests {
         let mut reader = RandomAccessReader::open_result(&archive_path).unwrap();
 
         assert_eq!(
-            reader.read_entry(0, "same.png").unwrap().unwrap().as_ref(),
+            reader
+                .read_entry(Default::default(), 0, "same.png")
+                .unwrap()
+                .unwrap()
+                .as_ref(),
             first_bytes
         );
         assert_eq!(
-            reader.read_entry(1, "same.png").unwrap().unwrap().as_ref(),
+            reader
+                .read_entry(Default::default(), 1, "same.png")
+                .unwrap()
+                .unwrap()
+                .as_ref(),
             second_bytes
         );
 
-        let document = load_document(&archive_path).unwrap();
+        let document = load_document(Default::default(), &archive_path).unwrap();
         assert_eq!(document.assets.len(), 2);
         assert_eq!(document.assets[0].layout, ImageLayout::Single);
         assert_eq!(document.assets[1].layout, ImageLayout::Spread);
@@ -1253,9 +1322,12 @@ mod tests {
         let cancel_token = ProgressiveArchiveCancelToken::default();
 
         let document = completed_document(
-            load_document_with_progress(&archive_path, &cancel_token, &mut |image| {
-                notifications.push(image)
-            })
+            load_document_with_progress(
+                Default::default(),
+                &archive_path,
+                &cancel_token,
+                &mut |image| notifications.push(image),
+            )
             .unwrap(),
         );
 
@@ -1331,10 +1403,15 @@ mod tests {
         let cancel_token = ProgressiveArchiveCancelToken::default();
         let mut notifications = Vec::new();
 
-        let outcome = stream_images(&archive_path, &cancel_token, &mut |image| {
-            let width = image::load_from_memory(&image.bytes).unwrap().width();
-            notifications.push((image.natural_index, image.total_images, width));
-        })
+        let outcome = stream_images(
+            Default::default(),
+            &archive_path,
+            &cancel_token,
+            &mut |image| {
+                let width = image::load_from_memory(&image.bytes).unwrap().width();
+                notifications.push((image.natural_index, image.total_images, width));
+            },
+        )
         .unwrap();
 
         assert!(matches!(
@@ -1347,7 +1424,13 @@ mod tests {
         );
 
         let document = completed_document(
-            load_document_with_progress(&archive_path, &cancel_token, &mut |_| {}).unwrap(),
+            load_document_with_progress(
+                Default::default(),
+                &archive_path,
+                &cancel_token,
+                &mut |_| {},
+            )
+            .unwrap(),
         );
         assert_eq!(document.assets.len(), 3);
     }
@@ -1367,10 +1450,15 @@ mod tests {
         let cancel_token = ProgressiveArchiveCancelToken::default();
         let mut notifications = 0;
 
-        let outcome = stream_images(&archive_path, &cancel_token, &mut |_| {
-            notifications += 1;
-            cancel_token.cancel();
-        })
+        let outcome = stream_images(
+            Default::default(),
+            &archive_path,
+            &cancel_token,
+            &mut |_| {
+                notifications += 1;
+                cancel_token.cancel();
+            },
+        )
         .unwrap();
 
         assert!(matches!(outcome, ProgressiveArchiveLoadOutcome::Cancelled));
@@ -1420,10 +1508,15 @@ mod tests {
         let cancel_token = ProgressiveArchiveCancelToken::default();
         let mut notifications = Vec::new();
 
-        let outcome = load_document_with_progress(&archive_path, &cancel_token, &mut |image| {
-            notifications.push(image);
-            cancel_token.cancel();
-        })
+        let outcome = load_document_with_progress(
+            Default::default(),
+            &archive_path,
+            &cancel_token,
+            &mut |image| {
+                notifications.push(image);
+                cancel_token.cancel();
+            },
+        )
         .unwrap();
 
         assert!(matches!(outcome, ProgressiveArchiveLoadOutcome::Cancelled));

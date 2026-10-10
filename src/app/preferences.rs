@@ -39,6 +39,8 @@ fn sync_switch_row<R: SwitchRowSync>(row: &R, handler: &R::Handler, active: bool
 
 pub(super) struct SettingsDialog {
     dialog: adw::PreferencesDialog,
+    archive_expansion_limit_row: adw::ComboRow,
+    archive_expansion_limit_handler: SignalHandlerId,
     click_mode_row: adw::ComboRow,
     show_document_boundary_page_row: adw::SwitchRow,
     scale_up_row: adw::SwitchRow,
@@ -193,11 +195,37 @@ impl SettingsDialog {
         let startup_group = adw::PreferencesGroup::builder().title("起動").build();
         startup_group.add(&startup_behavior_row);
 
+        let archive_expansion_limit_row = adw::ComboRow::builder()
+            .title("最大展開データ量")
+            .subtitle("上限を引き上げると一時ディスク使用量が増える場合があります")
+            .model(&gtk::StringList::new(&[
+                "2 GiB", "4 GiB", "8 GiB", "16 GiB",
+            ]))
+            .selected(archive_expansion_limit_index(
+                settings.archive_expansion_limit,
+            ))
+            .build();
+        let archive_group = adw::PreferencesGroup::builder().title("アーカイブ").build();
+        archive_group.add(&archive_expansion_limit_row);
+
+        let archive_expansion_limit_handler =
+            archive_expansion_limit_row.connect_selected_notify({
+                let sender = sender.clone();
+                move |row| {
+                    if let Some(limit) =
+                        crate::archive::ArchiveExpansionLimit::ALL.get(row.selected() as usize)
+                    {
+                        sender.input(Msg::SetArchiveExpansionLimit(*limit));
+                    }
+                }
+            });
+
         let page = adw::PreferencesPage::builder().title("設定").build();
         page.add(&viewing_group);
         page.add(&page_navigation_group);
         page.add(&display_group);
         page.add(&page_preview_group);
+        page.add(&archive_group);
         page.add(&bookshelf_group);
         page.add(&startup_group);
 
@@ -295,6 +323,8 @@ impl SettingsDialog {
         bookshelf_root_button.connect_clicked(move |_| sender.input(Msg::SelectBookshelfRoot));
 
         Self {
+            archive_expansion_limit_row,
+            archive_expansion_limit_handler,
             dialog,
             click_mode_row,
             show_document_boundary_page_row,
@@ -330,6 +360,14 @@ impl SettingsDialog {
     }
 
     pub(super) fn sync(&self, settings: &UserSettings) {
+        self.archive_expansion_limit_row
+            .block_signal(&self.archive_expansion_limit_handler);
+        self.archive_expansion_limit_row
+            .set_selected(archive_expansion_limit_index(
+                settings.archive_expansion_limit,
+            ));
+        self.archive_expansion_limit_row
+            .unblock_signal(&self.archive_expansion_limit_handler);
         self.click_mode_row.block_signal(&self.click_mode_handler);
         self.click_mode_row
             .set_selected(click_mode_index(settings.click_mode));
@@ -496,10 +534,31 @@ fn startup_behavior_from_index(index: u32) -> Option<StartupBehavior> {
     }
 }
 
+fn archive_expansion_limit_index(limit: crate::archive::ArchiveExpansionLimit) -> u32 {
+    crate::archive::ArchiveExpansionLimit::ALL
+        .iter()
+        .position(|value| *value == limit)
+        .unwrap() as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn archive_expansion_choices_select_the_default_and_round_trip() {
+        use crate::archive::ArchiveExpansionLimit;
+        assert_eq!(
+            archive_expansion_limit_index(UserSettings::default().archive_expansion_limit),
+            1
+        );
+        for (index, limit) in ArchiveExpansionLimit::ALL.into_iter().enumerate() {
+            assert_eq!(archive_expansion_limit_index(limit), index as u32);
+            assert_eq!(ArchiveExpansionLimit::from_gib(limit.gib()), Some(limit));
+        }
+        assert!(ArchiveExpansionLimit::ALL.get(4).is_none());
+    }
 
     #[derive(Default)]
     struct FakeSwitchRow {

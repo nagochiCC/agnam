@@ -16,7 +16,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 turbojpeg = { version = "1.5.1", default-features = false, features = ["pkg-config", "require-simd"] }
 tempfile = "3"
 sevenz-rust = { version = "0.6", default-features = false }
-unrar = "0.5"
+unrar = "=0.5.8"
+unrar_sys = "=0.5.8"
 tar = { version = "0.4", default-features = false }
 delharc = "0.8"
 memmap2 = "0.9"

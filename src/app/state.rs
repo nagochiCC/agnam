@@ -58,6 +58,7 @@ impl ViewerRuntimeState {
                 }
             },
         );
+        background.set_archive_expansion_limit(settings.archive_expansion_limit);
         let slider_auto_hide = effective_slider_auto_hide(settings.slider_auto_hide, false);
 
         Self {

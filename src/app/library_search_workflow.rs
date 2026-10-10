@@ -65,6 +65,7 @@ impl App {
         };
         let jobs = self.library.search_thumbnails.update_demand(evaluation);
         Self::spawn_library_search_thumbnail_jobs(
+            self.settings.archive_expansion_limit,
             jobs,
             self.library.search_thumbnails.cancellation_token(),
             sender,
@@ -77,6 +78,7 @@ impl App {
             .search_thumbnails
             .update_demand(SearchThumbnailDemandEvaluation::Ready(Vec::new()));
         Self::spawn_library_search_thumbnail_jobs(
+            self.settings.archive_expansion_limit,
             jobs,
             self.library.search_thumbnails.cancellation_token(),
             sender,
@@ -84,6 +86,7 @@ impl App {
     }
 
     fn spawn_library_search_thumbnail_jobs(
+        limit: crate::archive::ArchiveExpansionLimit,
         jobs: SearchThumbnailJobs,
         cancel: cover_cancel::CoverCancel,
         sender: &AppSender,
@@ -112,7 +115,7 @@ impl App {
             let cancel = cancel.clone();
             spawn_background(move || {
                 let result =
-                    generate_and_cache_bookshelf_thumbnail_with_cancel(&job.source, &|| {
+                    generate_and_cache_bookshelf_thumbnail_with_cancel(limit, &job.source, &|| {
                         cancel.cancelled()
                     })
                     .map_err(|error| error.to_string());
@@ -154,6 +157,7 @@ impl App {
             .complete_cache_load(generation, &source, succeeded);
         debug_assert_eq!(completion.accepted, accepted);
         Self::spawn_library_search_thumbnail_jobs(
+            self.settings.archive_expansion_limit,
             completion.jobs,
             self.library.search_thumbnails.cancellation_token(),
             sender,
@@ -173,6 +177,7 @@ impl App {
                 .search_thumbnails
                 .cancel_generation(generation, &source);
             Self::spawn_library_search_thumbnail_jobs(
+                self.settings.archive_expansion_limit,
                 jobs,
                 self.library.search_thumbnails.cancellation_token(),
                 sender,
@@ -200,6 +205,7 @@ impl App {
             .complete_generation(generation, &source, succeeded);
         debug_assert_eq!(completion.accepted, accepted);
         Self::spawn_library_search_thumbnail_jobs(
+            self.settings.archive_expansion_limit,
             completion.jobs,
             self.library.search_thumbnails.cancellation_token(),
             sender,

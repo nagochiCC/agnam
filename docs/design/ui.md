@@ -102,11 +102,18 @@ navigation rail下端のメインメニューは次の構成を維持する。
 - Overlay表示中は下のメインcontentへの入力を遮断するがHeaderBar、navigation rail、drawerは別階層として維持する。
 - Loading表示のactive request、表示状態、遅延通知revisionは `DocumentLoadController` が一体で所有し、画面種別やprogressive専用に重複したLoading stateを持たない。
 
+## アーカイブ設定
+
+- 設定画面の「アーカイブ」グループに「最大展開データ量」のComboRowを置き、2 GiB / 4 GiB / 8 GiB / 16 GiBの4択とする。defaultは4 GiBで、無制限・16 GiB超の値は選べない。
+- 説明は「上限を引き上げると一時ディスク使用量が増える場合があります」とする。archive file sizeやmemory保持量の上限ではなく、累積read / 展開・一時ディスク累積write・同時occupancyへ適用する。画像・通常fileのsingle entry 64 MiBを維持し、nestedとしてdisk materializeするarchive entryだけはoperation開始時の同じ設定値を上限とする。各4,096件のentry制限、Sequentialの256 MiB spill thresholdは維持する。
+- 変更は `AppSender` → `Msg::SetArchiveExpansionLimit` → `App::dispatch()` → `sync_ui_state()` の既存経路を使い、App所有の `UserSettings` を更新する。新たに開始するarchive operationへ適用し、実行中の非同期operationは開始時の値を使い続ける。
+
 ## 設定の所有と永続化
 
 - 永続設定の唯一の信頼できる状態はAppが所有する `settings::UserSettings`。設定画面、HeaderBar、Input、Action、PreviewController、SliderControllerへ同じ設定値の独立所有状態を作らない。
 - navigation panelのopen状態や選択pageはruntime stateであり設定へ保存しない。
 - 設定画面Widgetは `UserSettings` の投影として扱い、Appから同期する際はsignalをblockし、変更はAppの共通更新経路へ戻す。
 - 設定はGLib KeyFileでユーザー設定ディレクトリ配下の `agnam/settings.ini` へ保存する。ファイル欠損・個別キー欠損・不正値では該当するデフォルトへfallbackし、起動を妨げない。
-- 現在の主要デフォルトは、ページ移動=マウスボタン、Document境界ページ=ON、小さい画像の拡大=ON、スマートcrop=OFF、Spread=ON、HeaderBar自動非表示=OFF、Slider自動非表示=ON、サムネイル=ON、サムネイル位置=マウス追従、サムネイル生成速度=標準、本棚root=未設定、フォルダpreview高さ=78px、direct file Cover高さ=156px、本棚並び替え=ファイル名・昇順、起動時動作=本棚トップ、last sessionなし。
+- 最大展開データ量は同じ `settings.ini` の `[Settings]` に `archive-expansion-limit-gib=4` のようにGiB単位の整数（2 / 4 / 8 / 16）で保存する。旧file・キー欠損・不正値は4 GiBへfallbackし、既存設定のformat versionとmigration規則を維持する。
+- 現在の主要デフォルトは、最大展開データ量=4 GiB、ページ移動=マウスボタン、Document境界ページ=ON、小さい画像の拡大=ON、スマートcrop=OFF、Spread=ON、HeaderBar自動非表示=OFF、Slider自動非表示=ON、サムネイル=ON、サムネイル位置=マウス追従、サムネイル生成速度=標準、本棚root=未設定、フォルダpreview高さ=78px、direct file Cover高さ=156px、本棚並び替え=ファイル名・昇順、起動時動作=本棚トップ、last sessionなし。
 - 廃止済みキーは読み飛ばし、次回保存時には現在の設定だけを書き出す。旧 `slider-bar-mode` は既存migration規則を維持する。

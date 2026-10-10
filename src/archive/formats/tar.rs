@@ -103,6 +103,20 @@ pub(super) fn automatic_cover_entry_bytes(
     Ok(super::CoverEntryBytes::Missing)
 }
 
+// Keep tar's existing unpack/link/sparse handling; interrupt its bounded reads.
+struct CancelRead<'a, 'cancel> {
+    file: std::fs::File,
+    budget: &'a crate::archive::resource::ResourceBudget<'cancel>,
+}
+impl std::io::Read for CancelRead<'_, '_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.budget
+            .check_cancel()
+            .map_err(|_| std::io::ErrorKind::Other)?;
+        std::io::Read::read(&mut self.file, bytes)
+    }
+}
+
 pub(super) fn extract_to_dir(
     archive_path: &Path,
     destination: &Path,
@@ -126,14 +140,18 @@ pub(super) fn extract_to_dir(
     // A truncated payload makes `unpack` return an error after a partial write; the caller's
     // TempDir owns and removes that partial tree.
     let file = std::fs::File::open(archive_path)?;
-    let mut archive = tar::Archive::new(file);
-    archive
-        .unpack(destination)
-        .map_err(|error| AppError::Archive(error.to_string()))
+    let mut archive = tar::Archive::new(CancelRead { file, budget });
+    let result = archive.unpack(destination);
+    budget.check_cancel()?;
+    result.map_err(AppError::Io)
 }
 
-pub(super) fn load_document(archive_path: &Path) -> Result<Document, AppError> {
+pub(super) fn load_document(
+    limit: crate::archive::ArchiveExpansionLimit,
+    archive_path: &Path,
+) -> Result<Document, AppError> {
     load_document_with_limit(
+        limit,
         archive_path,
         super::SEQUENTIAL_ARCHIVE_MEMORY_LIMIT_BYTES,
         super::sequential_spill_root(),
@@ -141,6 +159,7 @@ pub(super) fn load_document(archive_path: &Path) -> Result<Document, AppError> {
 }
 
 fn load_document_with_limit(
+    limit: crate::archive::ArchiveExpansionLimit,
     archive_path: &Path,
     memory_limit: usize,
     spill_root: std::path::PathBuf,
@@ -148,7 +167,7 @@ fn load_document_with_limit(
     let file = std::fs::File::open(archive_path)?;
     let mut archive = tar::Archive::new(file);
     let mut images = SequentialImageStorage::with_limit_in(0, memory_limit, spill_root);
-    let mut budget = crate::archive::resource::ResourceBudget::default();
+    let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
 
     for (index, entry_result) in archive
         .entries()
@@ -432,8 +451,13 @@ mod tests {
         archive.finish().unwrap();
 
         let spill_root = directory.path().join("cache/agnam/tmp");
-        let document =
-            load_document_with_limit(&archive_path, first.len(), spill_root.clone()).unwrap();
+        let document = load_document_with_limit(
+            Default::default(),
+            &archive_path,
+            first.len(),
+            spill_root.clone(),
+        )
+        .unwrap();
         assert!(document.temp_dir.is_some());
         assert!(
             document

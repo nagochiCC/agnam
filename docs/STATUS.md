@@ -14,7 +14,7 @@ AgnamはRust + GTK4 / libadwaitaで実装している漫画・画像Viewerであ
 - 設定、通常window状態、last Document / logical pageを永続化し、起動時に復元できる。
 - Library / Viewer共通Drag and Dropに対応している。
 - archiveはZIP / CBZ、RAR / CBR、7z / CB7、TAR / CBT、LZH / LHAとnested archiveに対応する。RAR / 7zは条件に応じて全展開完了前から閲覧できるprogressive loadを使用する。
-- archive operationはsingle entry 64 MiB、累積read / 展開512 MiB、temporary disk累積write / 同時occupancy各512 MiB、total / image entries各4,096件で制限し、256 MiBはSequential memory spill thresholdとして維持する。
+- archive operationの累積read / 展開・temporary disk累積write / 同時occupancyは最大展開データ量設定（2 / 4 / 8 / 16 GiB、default 4 GiB）の開始時snapshotを使う。画像・通常fileのentry上限は64 MiB、nestedとしてdisk materializeするarchive entryだけは同じ設定値を上限にする。RARの `RAR_TEST` callback / 他形式のbounded readerを使い、Viewer・archive contents・Coverは内部archive全体をVecに保持せず、共有budget・cancel・workspace lifetimeを維持する。total / image entries各4,096件とSequentialの256 MiB spill thresholdは維持する。
 - 画像はPNG、JPG / JPEG、WebPに対応する。
 
 ## Architecture map
@@ -44,6 +44,7 @@ AgnamはRust + GTK4 / libadwaitaで実装している漫画・画像Viewerであ
 - v0.9.0の固定ソースからUbuntu 24.04基準のAppImageと対応ソースを生成する `packaging/appimage/` とActions workflowを備える。最終候補のActions全工程、Debian 13非GUI検証、対応ソースからのlibrary / runtime再ビルド・再リンク、通知一式の整合確認が完了した。Arch実機で日本語IME・表示・file chooserと起動警告の解消を確認済み。外部媒体操作は前候補で確認済み。Issue #1の配布可否調査を完了し、AppImage・checksum・対応ソースを [GitHub Release v0.9.0](https://github.com/nagochiCC/agnam/releases/tag/v0.9.0) で公開済み（[最終検証記録](research/issue-1-appimage-release-build.md#最終actions候補の採用判断)）。
 
 - current source of truth上、repository全体を塞ぐ未解決verification blockerは記録していない。個々の実装・GUI確認・検証runはGitHub Issuesで追跡し、current behaviorに影響する確定結果だけdocsへ反映する。
+- archiveの容量境界、65 MiBのRAR entry、RAR4 / RAR5・solid依存、対応形式のnested、cancel / I/O注入・cleanupと非同期回帰をRust testで確認している。decoder内部のRSS / CPU上限と即時cancelは保証対象外。実disk full、設定UI、実大容量RARの閲覧とGUI回帰確認は [Issue #2](https://github.com/nagochiCC/agnam/issues/2) の実機確認事項である。
 - nested archiveには再帰上限があり、安全な処理のため一時directoryを使う場合がある。
 - JPEG thumbnailはTurboJPEG / libjpeg-turboを使用し、現在のbuild構成では `pkg-config` から検出できる `libturbojpeg` とSIMD supportを前提とする。
 - PNG / WebPのCover thumbnailはJPEGの縮小decodeより生成costが高く、大量画像を含むarchiveではthumbnail生成に時間がかかる場合がある。CPU負荷抑制のため高並列decodeは行わない。

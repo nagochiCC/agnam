@@ -54,7 +54,7 @@ pub(crate) use sender::AppSender;
 use crate::archive::navigation::{find_sibling_file, sibling_container};
 use crate::archive::{
     ProgressiveArchiveCancelToken, ProgressiveArchiveImage, ProgressiveArchiveLoadOutcome,
-    archive_supports_sequential_progress, load_document_from_path,
+    archive_supports_sequential_progress, load_document_from_path_with_cancel,
     load_document_from_path_with_sequential_progress,
 };
 #[cfg(test)]

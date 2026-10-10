@@ -110,10 +110,16 @@ impl CoverSource {
         }
     }
 
-    pub(crate) fn load_bytes(&self) -> Result<Vec<u8>, CoverSourceLoadError> {
+    pub(crate) fn load_bytes_with_cancel(
+        &self,
+        limit: crate::archive::ArchiveExpansionLimit,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, CoverSourceLoadError> {
         match self {
             Self::File(path) => Ok(fs::read(path).map_err(AppError::from)?),
-            Self::ArchiveAuto(path) => Ok(archive::load_cover_source_bytes(path)?),
+            Self::ArchiveAuto(path) => Ok(archive::load_cover_source_bytes_with_cancel(
+                limit, path, cancelled,
+            )?),
             Self::FolderOverride { folder, relative } => {
                 let identity = CoverBookIdentity::image_folder(folder);
                 let path = folder.join(relative);
@@ -125,15 +131,17 @@ impl CoverSource {
                 }
                 Ok(fs::read(path).map_err(AppError::from)?)
             }
-            Self::ArchiveOverride { archive, id } => archive::load_archive_entry_bytes(archive, id)
-                .map_err(|error| match error {
-                    archive::ArchiveEntryLoadError::Missing => {
-                        CoverSourceLoadError::InvalidOverride(CoverBookIdentity::Archive(
-                            archive.clone(),
-                        ))
-                    }
-                    archive::ArchiveEntryLoadError::Other(error) => error.into(),
-                }),
+            Self::ArchiveOverride { archive, id } => {
+                archive::load_archive_entry_bytes_with_cancel(limit, archive, id, cancelled)
+                    .map_err(|error| match error {
+                        archive::ArchiveEntryLoadError::Missing => {
+                            CoverSourceLoadError::InvalidOverride(CoverBookIdentity::Archive(
+                                archive.clone(),
+                            ))
+                        }
+                        archive::ArchiveEntryLoadError::Other(error) => error.into(),
+                    })
+            }
             Self::ExternalOverride { identity, path } => {
                 if !path.is_file() || !archive::is_image_ext(path) {
                     return Err(CoverSourceLoadError::InvalidOverride(identity.clone()));

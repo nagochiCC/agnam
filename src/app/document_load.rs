@@ -72,6 +72,7 @@ struct ActiveLoadRequest {
     id: u64,
     purpose: LoadPurpose,
     replacement: bool,
+    cancel: crate::archive::ProgressiveArchiveCancelToken,
 }
 
 #[derive(Debug, Default)]
@@ -92,16 +93,32 @@ impl DocumentLoadController {
     }
 
     fn begin_with_replacement(&mut self, purpose: LoadPurpose, replacement: bool) -> (u64, u64) {
+        if let Some(active) = &self.active {
+            active.cancel.cancel();
+        }
         self.request_id = self.request_id.wrapping_add(1);
         let request_id = self.request_id;
         self.active = Some(ActiveLoadRequest {
             id: request_id,
             purpose,
             replacement,
+            cancel: Default::default(),
         });
         self.loading_visible = false;
         let loading_revision = self.advance_loading_revision();
         (request_id, loading_revision)
+    }
+
+    pub(super) fn cancel_token(
+        &self,
+        request_id: u64,
+    ) -> crate::archive::ProgressiveArchiveCancelToken {
+        self.active
+            .as_ref()
+            .filter(|request| request.id == request_id)
+            .expect("cancel token belongs to an active load")
+            .cancel
+            .clone()
     }
 
     pub(super) fn active_request_id(&self) -> Option<u64> {
@@ -159,7 +176,9 @@ impl DocumentLoadController {
     }
 
     pub(super) fn cancel(&mut self) {
-        self.active = None;
+        if let Some(active) = self.active.take() {
+            active.cancel.cancel();
+        }
         self.loading_visible = false;
         self.advance_loading_revision();
     }
@@ -256,6 +275,21 @@ impl SiblingLookupController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_and_cancel_stop_only_the_matching_background_load() {
+        let mut load = DocumentLoadController::default();
+        let (old, _) = load.begin(LoadPurpose::Normal);
+        let old_token = load.cancel_token(old);
+        let (current, _) = load.begin_replacement(LoadPurpose::Normal);
+        let current_token = load.cancel_token(current);
+        assert!(old_token.is_cancelled());
+        assert!(!current_token.is_cancelled());
+        assert!(load.finish(old).is_none());
+        assert!(!current_token.is_cancelled());
+        load.cancel();
+        assert!(current_token.is_cancelled());
+    }
 
     #[test]
     fn initial_page_resolution_does_not_index_the_document() {

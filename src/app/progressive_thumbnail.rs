@@ -20,7 +20,7 @@ impl ProgressiveThumbnailRequest {
         match &self.source {
             ImageSource::Memory(bytes) => Some(bytes.clone()),
             ImageSource::File(_) if self.temp_dir.is_some() => {
-                crate::archive::image_loader::load_image_bytes(&self.source)
+                crate::archive::image_loader::load_image_bytes(Default::default(), &self.source)
             }
             ImageSource::File(_) => None,
             ImageSource::ArchiveEntry { .. } => None,

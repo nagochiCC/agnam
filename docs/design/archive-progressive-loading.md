@@ -15,12 +15,12 @@
 - App側のbuffer、contiguous prefix、pending page move、stale結果排除、Loading / Slider制御は `ProgressiveArchiveState` でformat非依存に管理する。
 - Viewer側は `ViewerSession` のprogressive APIを共通利用し、RAR用・7z用の別stateを作らない。
 - format固有のentry identity、展開API、error処理は `archive::formats` の各実装へ閉じ込める。
-- 1 progressive load全体でsingle entry 64 MiB、累積read / 展開512 MiB、temporary disk累積write 512 MiB・同時occupancy 512 MiB、total / image entries各4,096件のoperation budgetを共有する。nested archiveも同じbudgetをdescendantまで共有する。
+- 1 progressive load全体で画像・通常fileのsingle entry 64 MiB、total / image entries各4,096件のoperation budgetを共有する。累積read / 展開、temporary disk累積write・同時occupancyにはload開始時の最大展開データ量設定（2 / 4 / 8 / 16 GiB、default 4 GiB）を適用する。実行中の設定変更でworkerのbudgetを変更しない。nested archiveの一括loadも同じbudgetをdescendantまで共有し、階層ごとにresetしない。nestedとしてdisk materializeするarchive entryだけは同じ設定値をsingle-entry上限とし、内部archive自体と子画像の両方を累積計上する。256 MiB spill thresholdとmemory保持方針は維持する。
 
 ## 展開順と自然順
 
 - archive内部のentry / decode順と漫画のnatural sort順は別物として扱う。
-- 展開Workerは、そのDocumentが閲覧対象である間は内部順で最後まで処理を継続する。別Documentへ移動する、本棚へ戻る等で不要になった場合はcancel tokenによる協調キャンセルを要求し、安全なentry / block境界で早期終了する。
+- 展開Workerは、そのDocumentが閲覧対象である間は内部順で最後の対象画像まで処理を継続する。別Documentへ移動する、本棚へ戻る等で不要になった場合はcancel tokenによる協調キャンセルを要求し、安全なchunk / entry / block境界で早期終了する。
 - キャンセル要求時に1entryのdecode中であれば、そのentryの処理が戻るまで停止が遅れることは許容し、強制的なthread停止は行わない。
 - 各画像の展開完了時に、自然順上の物理画像index、画像byte、`ImageLayout`を途中結果として通知する。
 - 自然順の先頭から連続して揃った画像だけをViewerへ解放する。
@@ -32,10 +32,11 @@
 ## RAR固有処理
 
 - RARは `unrar` のlisting順に対応するarchive indexをentry identityとして使う。
-- RARは `unpacked_size` をfull allocation前に64 MiBと照合し、`header.read()`後のactual byte lengthも検査してoperation budgetへ加算する。current `unrar 0.5.8` APIではdecode途中のruntime byte stopを呼出側から強制できず、metadataの過小申告まで含むallocation前hard limitを完全保証しない。
+- RARは `unrar_sys` 0.5.8の `RAR_TEST` と低レベルcallbackを使う。metadata preflightに加え、各chunkを画像Vecへ追加する前に実byte数を64 MiB・累積budgetと照合し、超過時はcallbackから中断する。disk materializeでは同じcallbackから一時fileへ書き、temporary write / occupancyも書込み前に検査する。callbackのerror / cancel理由を保持し、FFI復帰後に復元してhandleを必ず閉じる。callback bufferは保持せず、panicをFFI外へ伝搬しない。
 - listing結果とprocessing結果の対応を確認し、同名entryでも別entryとして扱う。
 - 画像の展開完了後に共通 `ProgressiveArchiveImage` へ変換してAppへ通知する。
-- progressiveキャンセルはlisting中、entry処理前、画像entryの展開完了後などの安全な境界で確認する。`header.read()` 実行中のentryを強制中断しない。
+- progressiveキャンセルはlisting中、entry前後、callback chunk境界で確認する。decoderがchunkを生成する前のallocation・CPU時間・RSSや完全な即時停止は保証しない。listing / processingのnative handleを同じmutexで直列化し、callbackや通知からnative処理へ再入しない。
+- solid RARでは後続対象entryへ到達するための前方fileを `RAR_TEST` + discardで処理し、保持せずに同じ累積budgetへ一度だけ計上する。`RAR_SKIP` によるcallbackなしの依存decodeを避ける。非solidの無関係entryはskipし、最後の対象画像の後は処理を終了する。従来未計上だったsolid依存bytesにより上限へ早く達する場合がある。stable archive index、同名entryの区別、自然順との分離は維持する。
 
 ## 7z固有処理とsolid制約
 

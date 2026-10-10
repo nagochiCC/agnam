@@ -54,11 +54,22 @@ pub(crate) struct ArchiveContentLevel {
     pub(crate) entries: Vec<PathBuf>,
     pub(crate) items: Vec<ArchiveContentItem>,
     pub(crate) reader: Arc<ArchiveEntryReader>,
-    _nested_workspace: Option<tempfile::TempDir>,
 }
 
 impl ArchiveContentLevel {
-    pub(crate) fn open(location: ArchiveLocation) -> Result<Self, AppError> {
+    #[cfg(test)]
+    pub(crate) fn open(
+        limit: crate::archive::ArchiveExpansionLimit,
+        location: ArchiveLocation,
+    ) -> Result<Self, AppError> {
+        Self::open_with_cancel(limit, location, &Default::default())
+    }
+
+    pub(crate) fn open_with_cancel(
+        limit: crate::archive::ArchiveExpansionLimit,
+        location: ArchiveLocation,
+        cancel: &crate::archive::ProgressiveArchiveCancelToken,
+    ) -> Result<Self, AppError> {
         if location.archives.len() > MAX_NESTED_DEPTH
             || !location
                 .archives
@@ -71,7 +82,9 @@ impl ArchiveContentLevel {
             ));
         }
 
-        let mut budget = crate::archive::resource::ResourceBudget::default();
+        let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
+        budget.set_cancel_token(cancel);
+        budget.check_cancel()?;
         let (physical_archive, workspace) =
             materialize_archive_chain(&location.archive, &location.archives, &mut budget)?;
         let entries = formats::entry_paths_with_budget(&physical_archive, &mut budget)?
@@ -79,12 +92,15 @@ impl ArchiveContentLevel {
             .filter(|path| is_normal_relative_path(path) && !is_macos_metadata_path(path))
             .collect::<Vec<_>>();
         let items = content_items(&entries, &location.directory);
+        let mut reader = ArchiveEntryReader::new(physical_archive);
+        // Thumbnail jobs retain this reader after navigation. Keep its physical
+        // nested archive alive until the last job releases the reader.
+        reader._workspace = workspace;
         Ok(Self {
             location,
             entries,
             items,
-            reader: Arc::new(ArchiveEntryReader::new(physical_archive)),
-            _nested_workspace: workspace,
+            reader: Arc::new(reader),
         })
     }
 
@@ -124,6 +140,7 @@ impl ArchiveContentLevel {
 pub(crate) struct ArchiveEntryReader {
     archive: PathBuf,
     extracted: Mutex<Option<ExtractedArchive>>,
+    _workspace: Option<tempfile::TempDir>,
 }
 
 #[derive(Debug)]
@@ -136,17 +153,35 @@ impl ArchiveEntryReader {
         Self {
             archive,
             extracted: Mutex::new(None),
+            _workspace: None,
         }
     }
 
     /// Reads one entry directly for random-access backends. Sequential/solid
     /// backends share one retained extraction so concurrent visible-demand
     /// jobs never expand the same archive once per card.
-    pub(crate) fn read(&self, entry: &Path) -> Result<Vec<u8>, AppError> {
+    #[cfg(test)]
+    pub(crate) fn read(
+        &self,
+        limit: crate::archive::ArchiveExpansionLimit,
+        entry: &Path,
+    ) -> Result<Vec<u8>, AppError> {
         self.read_with_budget(
             entry,
-            &mut crate::archive::resource::ResourceBudget::default(),
+            &mut crate::archive::resource::ResourceBudget::for_expansion_limit(limit),
         )
+    }
+
+    pub(crate) fn read_with_cancel(
+        &self,
+        limit: crate::archive::ArchiveExpansionLimit,
+        entry: &Path,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, AppError> {
+        let mut budget = crate::archive::resource::ResourceBudget::for_expansion_limit(limit);
+        budget.set_cancel_check(cancelled);
+        budget.check_cancel()?;
+        self.read_with_budget(entry, &mut budget)
     }
 
     fn read_with_budget(
@@ -191,46 +226,8 @@ impl ArchiveEntryReader {
                 entry.display()
             )));
         }
+        budget.preflight(std::fs::metadata(&path)?.len())?;
         Ok(std::fs::read(path)?)
-    }
-
-    fn read_transient_with_budget(
-        &self,
-        entry: &Path,
-        budget: &mut crate::archive::resource::ResourceBudget,
-    ) -> Result<Vec<u8>, AppError> {
-        if !is_normal_relative_path(entry) {
-            return Err(AppError::Archive("安全でないarchive entryです".into()));
-        }
-        match formats::cover_entry_bytes(&self.archive, entry, budget)? {
-            CoverEntryBytes::Bytes(bytes) => return Ok(bytes),
-            CoverEntryBytes::Missing => {
-                return Err(AppError::Archive(format!(
-                    "archive entryが見つかりません: {}",
-                    entry.display()
-                )));
-            }
-            CoverEntryBytes::Unsupported => {}
-        }
-
-        let directory = tempfile::Builder::new()
-            .prefix("agnam-archive-content-read-")
-            .tempdir()?;
-        let root = directory.path().to_path_buf();
-        let result = (|| {
-            formats::extract_to_dir_with_budget(&self.archive, &root, budget)?;
-            let path = root.join(entry);
-            if !path.is_file() {
-                return Err(AppError::Archive(format!(
-                    "archive entryが見つかりません: {}",
-                    entry.display()
-                )));
-            }
-            Ok(std::fs::read(path)?)
-        })();
-        drop(directory);
-        budget.release_temp_tree(&root)?;
-        result
     }
 }
 
@@ -252,14 +249,9 @@ fn materialize_archive_chain(
                 "アーカイブの階層が深すぎるか形式が不正です".into(),
             ));
         }
-        let bytes = ArchiveEntryReader::new(current).read_transient_with_budget(entry, budget)?;
-        let extension = entry
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("archive");
-        let nested = workspace.path().join(format!("level-{depth}.{extension}"));
-        budget.write_temp(&nested, &bytes)?;
-        current = nested;
+        let destination = workspace.path().join(format!("level-{depth}"));
+        current = formats::materialize_nested_entry(&current, entry, &destination, budget)?
+            .ok_or_else(|| AppError::Archive("Nested archive entry is missing".into()))?;
     }
     Ok((current, Some(workspace)))
 }
@@ -478,7 +470,9 @@ mod tests {
         zip.write_all(b"memo").unwrap();
         zip.finish().unwrap();
 
-        let level = ArchiveContentLevel::open(ArchiveLocation::root(archive_path)).unwrap();
+        let level =
+            ArchiveContentLevel::open(Default::default(), ArchiveLocation::root(archive_path))
+                .unwrap();
         assert_eq!(level.items.len(), 1);
         assert!(matches!(
             level.items[0].kind,
@@ -503,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn materializing_nested_tar_releases_transient_extraction_occupancy() {
+    fn materializing_nested_tar_keeps_file_backing_without_a_second_copy() {
         let mut inner = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         inner
             .start_file("page.jpg", zip::write::SimpleFileOptions::default())
@@ -539,13 +533,50 @@ mod tests {
         assert_eq!(std::fs::read(&materialized).unwrap(), inner);
         assert_eq!(
             budget.temp_counters(),
-            (inner.len() as u64 * 2, inner.len() as u64)
+            (inner.len() as u64, inner.len() as u64)
         );
 
         let workspace_path = workspace.path().to_path_buf();
         drop(workspace);
         budget.release_temp_tree(&workspace_path).unwrap();
-        assert_eq!(budget.temp_counters(), (inner.len() as u64 * 2, 0));
+        assert_eq!(budget.temp_counters(), (inner.len() as u64, 0));
+    }
+
+    #[test]
+    fn thumbnail_reader_keeps_nested_workspace_until_the_last_job_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("outer.rar");
+        let inner = super::super::formats::rar_native::stored_rar(&[("page.png", b"image")]);
+        std::fs::write(
+            &archive_path,
+            super::super::formats::rar_native::stored_rar(&[("inner.rar", &inner)]),
+        )
+        .unwrap();
+        let level = ArchiveContentLevel::open(
+            Default::default(),
+            ArchiveLocation {
+                archive: archive_path,
+                archives: vec![PathBuf::from("inner.rar")],
+                directory: PathBuf::new(),
+            },
+        )
+        .unwrap();
+        let reader = level.reader.clone();
+        let physical_archive = reader.archive.clone();
+        drop(level);
+        assert!(physical_archive.is_file());
+        assert_eq!(
+            reader
+                .read(Default::default(), Path::new("page.png"))
+                .unwrap(),
+            b"image"
+        );
+        assert!(matches!(
+            reader.read_with_cancel(Default::default(), Path::new("page.png"), &|| true),
+            Err(AppError::ArchiveCancelled)
+        ));
+        drop(reader);
+        assert!(!physical_archive.exists());
     }
 
     #[test]
@@ -576,7 +607,9 @@ mod tests {
             .unwrap();
         writer.finish().unwrap();
 
-        let level = ArchiveContentLevel::open(ArchiveLocation::root(archive_path)).unwrap();
+        let level =
+            ArchiveContentLevel::open(Default::default(), ArchiveLocation::root(archive_path))
+                .unwrap();
         let (_, plan) = level.progressive_thumbnail_plan().unwrap();
         assert_eq!(
             plan,
@@ -616,7 +649,9 @@ mod tests {
             .unwrap();
         writer.finish().unwrap();
 
-        let level = ArchiveContentLevel::open(ArchiveLocation::root(archive_path)).unwrap();
+        let level =
+            ArchiveContentLevel::open(Default::default(), ArchiveLocation::root(archive_path))
+                .unwrap();
         let (_, plan) = level.progressive_thumbnail_plan().unwrap();
         assert_eq!(
             plan,
