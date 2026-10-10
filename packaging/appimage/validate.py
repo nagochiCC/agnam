@@ -30,7 +30,7 @@ def environment(root, state):
     return env
 
 
-def payload(root, report):
+def payload(root, report, development=False):
     env = environment(root, report.parent / 'test-state')
     require(os.access(root / 'AppRun', os.X_OK), 'AppRun not executable')
     require(os.access(root / 'usr/bin/agnam', os.X_OK), 'Agnam not executable')
@@ -81,7 +81,11 @@ def payload(root, report):
                 'libgdk_pixbuf-2.0.so.0', 'librsvg-2.so.2', 'libwebp.so.7', 'libstdc++.so.6', 'libfontconfig.so.1']
     require(all((root / 'usr/lib' / p).is_file() for p in required), 'Required library missing')
     doc = root / 'usr/share/doc/agnam'
-    require(json.loads((doc / 'agnam-patches.json').read_text()) == CSS_PATCH, 'CSS patch record mismatch')
+    if development:
+        from development import verify_payload
+        verify_payload(root)
+    else:
+        require(json.loads((doc / 'agnam-patches.json').read_text()) == CSS_PATCH, 'CSS patch record mismatch')
     for relative in ['fonts.conf', 'conf.d/50-user.conf', 'conf.d/51-local.conf', 'local.conf', 'conf.avail/51-local.conf']:
         require((root / 'etc/fonts' / relative).is_file(), f'Fontconfig configuration missing: {relative}')
     require(not list(root.glob('usr/share/fonts/**/*')), 'Host font files bundled')
@@ -125,7 +129,7 @@ def probe(root, executable, fixtures, report):
     print(result.stdout, end='')
 
 
-def image(artifact, w):
+def image(artifact, w, development=False):
     with artifact.open('rb') as f:
         require(f.read(11)[8:11] == b'AI\x02', 'Not AppImage Type 2')
     require(os.access(artifact, os.X_OK), 'AppImage not executable')
@@ -141,11 +145,11 @@ def image(artifact, w):
         elif p.is_file():
             require(digest(p) == digest(other), f'Extracted file mismatch: {p}')
     run(artifact, '--appimage-extract-and-run', '--help', env=env)
-    payload(root, w / 'validation/elf.json')
+    payload(root, w / 'validation/elf.json', development)
     probe(root, w / 'nogui-probe', w / 'fixtures', w / 'validation/ubuntu-probe.log')
 
 
-def source(archive, w):
+def source(archive, w, development=False):
     target = w / 'source-extraction'
     target.mkdir()
     with tarfile.open(archive) as t:
@@ -167,17 +171,29 @@ def source(archive, w):
         require(re.search(r'^Source: ' + re.escape(component['source']) + r'$', text, re.M), 'Source package identity mismatch')
         require(re.search(r'^Version: ' + re.escape(component['version']) + r'$', text, re.M), 'Source package version mismatch')
     verify_inputs(s / 'inputs')
-    original = s / 'inputs' / LOCK['sources']['agnam']['file']
-    require(digest(original) == LOCK['sources']['agnam']['sha256'], 'Original tag archive mismatch')
-    require(json.loads((s / 'agnam-patches.json').read_text()) == CSS_PATCH, 'Source patch record mismatch')
-    app = extract(original, w / 'patched-source-check')
+    authority = json.loads((s / 'source-authority.json').read_text())
+    require(development == (authority.get('distribution') == 'development'), 'Source distribution mode mismatch')
     # Use the recipe/patch actually distributed in this archive, not the checkout.
-    run('python3', '-c', 'import package; from pathlib import Path; import sys; package.apply_agnam_patch(Path(sys.argv[1]))',
-        app, cwd=s / 'packaging/appimage')
-    require(app_css(app) == (w / 'AppDir/usr/share/doc/agnam/APP_CSS.css').read_text(), 'Rebuilt CSS differs from payload')
+    if development:
+        run('python3', s / 'packaging/appimage/development.py', 'check-source', s, w)
+        app = next((w / 'patched-source-check').iterdir())
+    else:
+        original = s / 'inputs' / LOCK['sources']['agnam']['file']
+        require(digest(original) == LOCK['sources']['agnam']['sha256'], 'Original tag archive mismatch')
+        require(json.loads((s / 'agnam-patches.json').read_text()) == CSS_PATCH, 'Source patch record mismatch')
+        app = extract(original, w / 'patched-source-check')
+        run('python3', '-c', 'import package; from pathlib import Path; import sys; package.apply_agnam_patch(Path(sys.argv[1]))',
+            app, cwd=s / 'packaging/appimage')
+        require(app_css(app) == (w / 'AppDir/usr/share/doc/agnam/APP_CSS.css').read_text(), 'Rebuilt CSS differs from payload')
     require((s / 'patches/libfuse/mount.c.diff').is_file(), 'AppImage libfuse patch missing')
     # Offline build from the archive, never reuse the original objects or prefixes.
     run('bash', s / 'packaging/appimage/native.sh', s / 'inputs', w / 'source-rebuild', 'all')
+    if development:
+        # Also compile the exact development application from distributed vendor sources.
+        env = os.environ | {'CARGO_TARGET_DIR': str(w / 'source-app-target'),
+            'PKG_CONFIG_PATH': str(w / 'source-rebuild/prefix/lib/pkgconfig'),
+            'LD_LIBRARY_PATH': str(w / 'source-rebuild/prefix/lib')}
+        run('cargo', 'build', '--release', '--locked', '--offline', '-j', os.environ.get('BUILD_JOBS', '2'), cwd=app, env=env)
     runtime = w / 'source-rebuild/runtime-x86_64'
     run(runtime, '--appimage-version')
     # Use the rebuilt/relinked runtime to extract and run the original candidate payload.
@@ -195,15 +211,18 @@ def source(archive, w):
         'tiff_jbig_off_rebuilt': True, 'cairo_lzo_disabled_rebuilt': True, 'turbo_simd_rebuilt': True,
         'fontconfig_relative_templates_rebuilt': True, 'agnam_css_patch_reapplied': True,
         'runtime_offline_rebuilt': True, 'relinked_runtime_extract_and_run': True,
-        'runtime_sha256': digest(runtime)})
+        'runtime_sha256': digest(runtime), **({'development_application_offline_rebuilt': True,
+        'development_commit': authority['commit']} if development else {})})
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('command', choices=['payload', 'image', 'source', 'probe'])
+    p.add_argument('--development', action='store_true')
     p.add_argument('paths', type=Path, nargs='+')
     a = p.parse_args()
-    globals()[a.command](*[x.resolve() for x in a.paths])
+    options = {'development': a.development} if a.command != 'probe' else {}
+    globals()[a.command](*[x.resolve() for x in a.paths], **options)
 
 
 if __name__ == '__main__':

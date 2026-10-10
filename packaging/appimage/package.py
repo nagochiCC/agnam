@@ -124,6 +124,15 @@ def rust(root):
     require(authority_record['tag'] == 'v0.9.0' and authority_record['commit'] == LOCK['agnam_commit']
             and authority_record['sha256'] == LOCK['sources']['agnam']['sha256'], 'Source authority record mismatch')
     require(digest(root / LOCK['sources']['agnam']['file']) == authority_record['sha256'], 'Agnam archive mismatch')
+    tools = install_rust(root)
+    app = extract(root / LOCK['sources']['agnam']['file'], root.parent / 'agnam-source')
+    require(tomllib.loads((app / 'Cargo.toml').read_text())['package']['version'] == '0.9.0', 'Agnam version mismatch')
+    apply_agnam_patch(app)
+    write_json(root.parent / 'agnam-patches.json', CSS_PATCH)
+    vendor_rust(root, tools, app)
+
+
+def install_rust(root):
     tools = root.parent / 'toolchain'
     for name in ['rustc', 'cargo', 'rust-std', 'rust-src', 'rust-docs']:
         v = LOCK['sources'][name]
@@ -131,10 +140,10 @@ def rust(root):
         tree = extract(root / v['file'], root.parent / ('install-' + name))
         run('bash', tree / 'install.sh', '--prefix=' + str(tools), '--disable-ldconfig')
     require(output(tools / 'bin/rustc', '--version').startswith('rustc ' + LOCK['rust'] + ' '), 'Rust version mismatch')
-    app = extract(root / LOCK['sources']['agnam']['file'], root.parent / 'agnam-source')
-    require(tomllib.loads((app / 'Cargo.toml').read_text())['package']['version'] == '0.9.0', 'Agnam version mismatch')
-    apply_agnam_patch(app)
-    write_json(root.parent / 'agnam-patches.json', CSS_PATCH)
+    return tools
+
+
+def vendor_rust(root, tools, app):
     # Complete locked vendor set includes native code, build crates and other targets.
     env = os.environ | {'PATH': str(tools / 'bin') + ':' + os.environ['PATH'], 'CARGO_HOME': str(root.parent / 'cargo-home')}
     config = output(tools / 'bin/cargo', 'vendor', '--locked', root.parent / 'vendor', cwd=app, env=env)
@@ -155,9 +164,9 @@ def apply_agnam_patch(app):
     require(digest(target) == CSS_PATCH['patched_sha256'], 'Patched Agnam source hash mismatch')
 
 
-def app_css(app):
-    target = app / CSS_PATCH['target']
-    require(digest(target) == CSS_PATCH['patched_sha256'], 'Patched Agnam source hash mismatch')
+def app_css(app, patch=CSS_PATCH):
+    target = app / patch['target']
+    require(digest(target) == patch['patched_sha256'], 'Patched Agnam source hash mismatch')
     return re.search(r'const APP_CSS: &str = r#"(.*?)"#;', target.read_text(), re.S)[1]
 
 
@@ -221,7 +230,7 @@ def owner(path):
     return names.pop()
 
 
-def appdir(w):
+def appdir(w, development=False):
     a = w / 'AppDir'
     a.mkdir(exist_ok=False)
     src = next((w / 'agnam-source').iterdir())
@@ -306,9 +315,10 @@ def appdir(w):
     provenance['etc/fonts/local.conf'] = {'component': 'packaging', 'generated': 'empty system customization'}
     doc = a / 'usr/share/doc/agnam'
     doc.mkdir(parents=True)
-    (doc / 'APP_CSS.css').write_text(app_css(src))
+    css_patch = json.loads((w / 'agnam-patches.json').read_text()) if development else CSS_PATCH
+    (doc / 'APP_CSS.css').write_text(app_css(src, css_patch))
     provenance['usr/share/doc/agnam/APP_CSS.css'] = {'component': 'agnam', 'generated_from': CSS_PATCH['target'],
-                                                  'patched_source_sha256': CSS_PATCH['patched_sha256']}
+                                                  'patched_source_sha256': css_patch['patched_sha256']}
     copy(w / 'agnam-patches.json', doc / 'agnam-patches.json')
     for relative in ['usr/share/glib-2.0/schemas', 'usr/share/icons/Adwaita', 'usr/share/mime']:
         for p in sorted(Path('/' + relative).rglob('*')):
@@ -338,7 +348,10 @@ def appdir(w):
     for p in [Path(output('gcc', '-print-libgcc-file-name').strip()), Path(output('gcc', '-print-file-name=crtbeginS.o').strip())]:
         pkg = owner(p)
         packages[pkg] = package_info(pkg)
-    notices(w, a, src, packages)
+    notices(w, a, src, packages, development)
+    if development:
+        from development import record_build
+        record_build(w, src, doc)
     write_json(a / 'usr/share/doc/agnam/distribution-build-paths.json', inherited_build_paths)
     for relative, entry in provenance.items():
         entry['sha256'] = digest(a / relative)
@@ -348,7 +361,7 @@ def appdir(w):
     write_json(w / 'ubuntu-packages.json', list(packages.values()))
 
 
-def notices(w, a, src, packages):
+def notices(w, a, src, packages, development=False):
     doc = a / 'usr/share/doc/agnam'
     third = doc / 'third-party'
     copy(src / 'LICENSE', doc / 'LICENSE')
@@ -475,16 +488,35 @@ For the statically linked libfuse, see packaging/appimage/README.md and native.s
 in the source archive: modify the fuse source/patch, adjust its recorded checksum,
 and rebuild the runtime. Agnam itself need not be relinked for this replacement.
 ''')
+    if development:
+        notice = doc / 'THIRD_PARTY_NOTICES.md'
+        notice.write_text(notice.read_text().replace('Agnam 0.9.0 AppImage', 'Agnam development AppImage', 1))
+        source = doc / 'SOURCE_CODE.md'
+        text = source.read_text().replace('Agnam-0.9.0-', 'Agnam-development-')
+        start = text.index('The upstream Agnam v0.9.0 archive')
+        end = text.index('Fontconfig retains', start)
+        text = text[:start] + '''The Agnam input is an archive of the exact Actions checkout commit recorded in
+source-authority.json. development-build.json records the compiled source hashes,
+Cargo.lock and packaged executable hash. agnam-patches.json records the separate
+development GTK 4.14 CSS substitutions (possibly empty); no v0.9.0 patch is applied.
+See packaging/appimage/DEVELOPMENT.md for the offline application/rebuild procedure.
+''' + text[end:]
+        source.write_text(text)
 
 
-def sources(w):
+def sources(w, development=False):
     s = w / 'corresponding-source'
     s.mkdir(exist_ok=False)
     shutil.copytree(RECIPE, s / 'packaging/appimage', ignore=shutil.ignore_patterns('__pycache__'))
     upstream = s / 'inputs'
     upstream.mkdir()
-    for n in sorted(RUNTIME | NATIVE | {'agnam', 'rust-src'} | {n for n in LOCK['sources'] if n.startswith('librsvg-stdlib-')}):
+    app_inputs = set() if development else {'agnam'}
+    for n in sorted(RUNTIME | NATIVE | app_inputs | {'rust-src'} | {n for n in LOCK['sources'] if n.startswith('librsvg-stdlib-')}):
         copy(w / 'input' / LOCK['sources'][n]['file'], upstream / LOCK['sources'][n]['file'])
+    if development:
+        authority_record = json.loads((w / 'source-authority.json').read_text())
+        copy(w / 'input' / authority_record['file'], upstream / authority_record['file'])
+        copy(w / 'development-build.json', s / 'development-build.json')
     shutil.copytree(w / 'vendor', s / 'vendor')
     ubuntu = s / 'ubuntu'
     ubuntu.mkdir()
@@ -517,7 +549,7 @@ def sources(w):
     write_json(s / 'ubuntu-source-manifest.json', source_manifest)
     write_json(s / 'build-environment.json', {'ubuntu_image': LOCK['ubuntu_image'], 'snapshot': LOCK['ubuntu_snapshot'],
         'packaging_commit': os.environ.get('PACKAGING_COMMIT', 'local-working-tree'),
-        'source_date_epoch': EPOCH, 'rust': output(w / 'toolchain/bin/rustc', '-Vv'),
+        'source_date_epoch': int(os.environ['SOURCE_DATE_EPOCH']) if development else EPOCH, 'rust': output(w / 'toolchain/bin/rustc', '-Vv'),
         'installed_packages': output('dpkg-query', '-W'), 'compiler': output('gcc', '--version'), 'runtime_compiler': output('clang', '--version'), 'kernel': list(os.uname())})
     sums = [f'{digest(p)}  {p.relative_to(s)}' for p in sorted(s.rglob('*')) if p.is_file()]
     (s / 'SHA256SUMS').write_text('\n'.join(sums) + '\n')

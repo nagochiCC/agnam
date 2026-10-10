@@ -1,5 +1,8 @@
 # Agnam 0.9.0 AppImageの正式候補ビルド
 
+現在のcheckoutを使う開発版は別の [開発版AppImage手順](DEVELOPMENT.md) を参照する。
+この文書と `appimage.yml` / `build.sh` は引き続き固定v0.9.0専用である。
+
 この構成はUbuntu 24.04 / x86_64で正式候補と対応ソースを生成する。
 GitHub Releaseの作成・更新は行わない。公開前にActionsでの成功結果、
 通知・対応ソース、今回生成した候補の実機GUIを確認する。Issue #1は最終確認までopenとする。

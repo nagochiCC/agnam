@@ -17,6 +17,8 @@
 
 - [`../README.md`](../README.md): 利用者向けの製品概要、対応形式、build / run、基本的な使い方
 - [`../AGENTS.md`](../AGENTS.md): Agnam固有の実装・検証制約
+- [`../packaging/appimage/README.md`](../packaging/appimage/README.md): 固定v0.9.0向けAppImageの生成・検証
+- [`../packaging/appimage/DEVELOPMENT.md`](../packaging/appimage/DEVELOPMENT.md): 開発版AppImageのActions Artifacts生成・取得・対応ソース
 
 ## 読み方と更新
 

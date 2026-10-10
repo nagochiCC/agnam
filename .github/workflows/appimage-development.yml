@@ -1,0 +1,112 @@
+name: AppImage development (Artifacts)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: appimage-development-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'nagochiCC/agnam' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout exact development commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check packaging scripts
+        run: |
+          bash -n packaging/appimage/build.sh packaging/appimage/build-development.sh packaging/appimage/native.sh packaging/appimage/AppRun
+          python3 -m unittest discover -s packaging/appimage -p 'test_*.py'
+      - name: Verify checkout and freeze development source
+        run: |
+          mkdir -p "$RUNNER_TEMP/agnam-development"
+          python3 packaging/appimage/development.py snapshot "$GITHUB_WORKSPACE" "$RUNNER_TEMP/agnam-development"
+      - name: Build fixed Ubuntu environment
+        run: docker build --target build -t agnam-development-build packaging/appimage
+      - name: Build and validate development AppImage and corresponding source
+        id: appimage-build
+        env:
+          PACKAGING_COMMIT: ${{ github.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/agnam-development"
+          docker run --rm \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/packaging/appimage,dst=/recipe,readonly" \
+            --mount "type=bind,src=$RUNNER_TEMP/agnam-development,dst=/build" \
+            --env PACKAGING_COMMIT --env BUILD_JOBS=2 \
+            agnam-development-build bash /recipe/build-development.sh
+      - name: Return output ownership to the runner
+        if: always() && steps.appimage-build.outcome != 'skipped'
+        run: |
+          docker run --rm --network=none \
+            --env OUTPUT_UID="$(id -u)" --env OUTPUT_GID="$(id -g)" \
+            --mount "type=bind,src=$RUNNER_TEMP/agnam-development,dst=/build" \
+            agnam-development-build bash -eu -c '
+              for path in /build/dist /build/logs /build/validation /build/extraction; do
+                if [[ -d $path ]]; then
+                  chown -hR "$OUTPUT_UID:$OUTPUT_GID" "$path"
+                fi
+              done
+            '
+      - name: Rebuild runtime in a fresh container with networking disabled
+        run: |
+          mkdir -p "$RUNNER_TEMP/agnam-runtime-offline"
+          docker run --rm --network=none \
+            --user "$(id -u):$(id -g)" --env HOME=/build \
+            --mount "type=bind,src=$RUNNER_TEMP/agnam-development/dist/Agnam-development-AppImage-corresponding-source.tar.xz,dst=/input/source.tar.xz,readonly" \
+            --mount "type=bind,src=$RUNNER_TEMP/agnam-runtime-offline,dst=/build" \
+            agnam-development-build bash -eu -c '
+              tar -xJf /input/source.tar.xz -C /build
+              cd /build/corresponding-source
+              sha256sum -c SHA256SUMS
+              bash packaging/appimage/native.sh /build/corresponding-source/inputs /build/rebuilt runtime
+              /build/rebuilt/runtime-x86_64 --appimage-version
+            ' > "$RUNNER_TEMP/agnam-development/validation/offline-runtime.log" 2>&1
+          cp "$RUNNER_TEMP/agnam-development/validation/offline-runtime.log" "$RUNNER_TEMP/agnam-development/dist/validation/"
+      - name: Validate on Debian 13 without host GTK
+        run: |
+          docker build --target debian-validation -t agnam-development-debian packaging/appimage
+          docker run --rm \
+            --user "$(id -u):$(id -g)" --env HOME=/build \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/packaging/appimage,dst=/recipe,readonly" \
+            --mount "type=bind,src=$RUNNER_TEMP/agnam-development,dst=/build" \
+            agnam-development-debian bash -eu -c '
+              python3 /recipe/validate.py --development payload /build/extraction/squashfs-root /build/validation/debian-elf.json
+              python3 /recipe/validate.py probe /build/extraction/squashfs-root /build/nogui-probe /build/fixtures /build/validation/debian-probe.log
+              env -u DISPLAY -u WAYLAND_DISPLAY -u DBUS_SESSION_BUS_ADDRESS /build/candidate.AppImage --appimage-extract-and-run --help
+              dpkg-query -W > /build/validation/debian-packages.txt
+              cp -r /build/validation/. /build/dist/validation/
+            '
+      - name: Check final checksums and publish run identity in summary
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          cd "$RUNNER_TEMP/agnam-development/dist"
+          sha256sum -c Agnam-development-x86_64.AppImage.sha256
+          sha256sum -c Agnam-development-AppImage-corresponding-source.tar.xz.sha256
+          printf 'Development source commit: `%s`\n\nArtifact retention: 30 days.\n' "$SOURCE_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload validated development build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Agnam-development-x86_64-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/agnam-development/dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Agnam-development-failed-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/agnam-development/logs/
+            ${{ runner.temp }}/agnam-development/validation/
+          if-no-files-found: ignore
+          retention-days: 7
